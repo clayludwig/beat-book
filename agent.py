@@ -1,7 +1,7 @@
 """
 agent.py
 --------
-Ollama-powered agent (qwen3.5:397b-cloud) that has tools to explore stories/
+Claude-powered agent (Sonnet 4.6) that has tools to explore stories/
 topics and interview the reporter, then produces a beat book.
 
 The agent runs in an async loop.  Most tools execute locally, but
@@ -10,11 +10,12 @@ via a callback.  The callback returns the user's answer so the loop can
 resume.
 """
 
+import asyncio
 import json
-from typing import Callable, Awaitable, Any
+from typing import Callable, Awaitable
 
 from pipeline import PipelineResult
-from ollama_client import CHAT_MODEL, chat_client, prepare_thinking
+from claude_client import CHAT_MODEL, chat_client, thinking_param
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL
@@ -22,167 +23,150 @@ from ollama_client import CHAT_MODEL, chat_client, prepare_thinking
 
 AGENT_MODEL = CHAT_MODEL
 
-# Generous output cap — beat books can be long. Qwen3.5 supports a 256K total
-# context so this leaves plenty of room for the conversation history.
+# Generous output cap — beat books can be long. Sonnet 4.6 supports a
+# 1M token context window and up to 128k output tokens; 32k per turn is
+# plenty for a beat-book draft plus a few tool calls.
 MAX_TOKENS_PER_TURN = 32768
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOOL DEFINITIONS (OpenAI tool-use schema, used by Ollama's OpenAI-compatible API)
+# TOOL DEFINITIONS (Anthropic tool-use schema)
 # ─────────────────────────────────────────────────────────────────────────────
 
 TOOLS = [
     {
-        "type": "function",
-        "function": {
-            "name": "view_topics",
-            "description": (
-                "View all discovered topics from the uploaded stories. Returns broad "
-                "and specific topics with story counts. Use this first to understand "
-                "the landscape of coverage."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
+        "name": "view_topics",
+        "description": (
+            "View all discovered topics from the uploaded stories. Returns broad "
+            "and specific topics with story counts. Use this first to understand "
+            "the landscape of coverage."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "list_stories_in_topic",
-            "description": (
-                "List all stories that belong to a given topic. Returns story index, "
-                "title, and date for each."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "topic": {
-                        "type": "string",
-                        "description": "The exact topic label to look up.",
-                    },
+        "name": "list_stories_in_topic",
+        "description": (
+            "List all stories that belong to a given topic. Returns story index, "
+            "title, and date for each."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "The exact topic label to look up.",
                 },
-                "required": ["topic"],
             },
+            "required": ["topic"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "read_story",
-            "description": (
-                "Read the full content of a story by its index number. Returns title, "
-                "author, date, and full text."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "index": {
-                        "type": "integer",
-                        "description": "Zero-based story index.",
-                    },
+        "name": "read_story",
+        "description": (
+            "Read the full content of a story by its index number. Returns title, "
+            "author, date, and full text."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "index": {
+                    "type": "integer",
+                    "description": "Zero-based story index.",
                 },
-                "required": ["index"],
             },
+            "required": ["index"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "search_stories",
-            "description": (
-                "Search stories by keyword. Returns matching story indices, titles, "
-                "and dates."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Keyword or phrase to search for in story titles and content.",
-                    },
+        "name": "search_stories",
+        "description": (
+            "Search stories by keyword. Returns matching story indices, titles, "
+            "and dates."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keyword or phrase to search for in story titles and content.",
                 },
-                "required": ["query"],
             },
+            "required": ["query"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "interview_user",
-            "description": (
-                "Ask the reporter a BATCH of interview questions in a single form. "
-                "The reporter fills out all questions at once and submits. Strongly "
-                "prefer asking 3–6 related questions in one call over many separate "
-                "calls — it gives the reporter context for what you're trying to "
-                "learn and avoids a tedious back-and-forth. Only call this tool a "
-                "second time if a follow-up is genuinely necessary based on their "
-                "first answers.\n\n"
-                "Each question supports one of four input types:\n"
-                "- 'checklist': multi-select checkboxes (use for 'select all that apply')\n"
-                "- 'single_choice': radio buttons — pick exactly one\n"
-                "- 'multiple_choice': checkboxes — pick one or more\n"
-                "- 'free_response': open text input\n"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "intro": {
-                        "type": "string",
-                        "description": "Optional 1–2 sentence intro shown above the form to frame what you're asking and why.",
-                    },
-                    "questions": {
-                        "type": "array",
-                        "description": "Ordered list of questions to present in one form (3–6 recommended).",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "question": {
-                                    "type": "string",
-                                    "description": "The question text.",
-                                },
-                                "question_type": {
-                                    "type": "string",
-                                    "enum": ["checklist", "single_choice", "multiple_choice", "free_response"],
-                                },
-                                "options": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "Options for checklist / single_choice / multiple_choice. Leave empty for free_response.",
-                                },
+        "name": "interview_user",
+        "description": (
+            "Ask the reporter a BATCH of interview questions in a single form. "
+            "The reporter fills out all questions at once and submits. Strongly "
+            "prefer asking 3–6 related questions in one call over many separate "
+            "calls — it gives the reporter context for what you're trying to "
+            "learn and avoids a tedious back-and-forth. Only call this tool a "
+            "second time if a follow-up is genuinely necessary based on their "
+            "first answers.\n\n"
+            "Each question supports one of four input types:\n"
+            "- 'checklist': multi-select checkboxes (use for 'select all that apply')\n"
+            "- 'single_choice': radio buttons — pick exactly one\n"
+            "- 'multiple_choice': checkboxes — pick one or more\n"
+            "- 'free_response': open text input\n"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intro": {
+                    "type": "string",
+                    "description": "Optional 1–2 sentence intro shown above the form to frame what you're asking and why.",
+                },
+                "questions": {
+                    "type": "array",
+                    "description": "Ordered list of questions to present in one form (3–6 recommended).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "The question text.",
                             },
-                            "required": ["question", "question_type"],
+                            "question_type": {
+                                "type": "string",
+                                "enum": ["checklist", "single_choice", "multiple_choice", "free_response"],
+                            },
+                            "options": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Options for checklist / single_choice / multiple_choice. Leave empty for free_response.",
+                            },
                         },
+                        "required": ["question", "question_type"],
                     },
                 },
-                "required": ["questions"],
             },
+            "required": ["questions"],
         },
     },
     {
-        "type": "function",
-        "function": {
-            "name": "generate_beat_book",
-            "description": (
-                "Write the final beat book as a Markdown document. Call this once you "
-                "have gathered enough information from the topics, stories, and the "
-                "reporter's answers. The content you pass will be saved as the output file."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "markdown_content": {
-                        "type": "string",
-                        "description": "The complete beat book in Markdown format.",
-                    },
-                    "filename": {
-                        "type": "string",
-                        "description": "Filename for the beat book (e.g. 'sports_beat_book.md').",
-                    },
+        "name": "generate_beat_book",
+        "description": (
+            "Write the final beat book as a Markdown document. Call this once you "
+            "have gathered enough information from the topics, stories, and the "
+            "reporter's answers. The content you pass will be saved as the output file."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "markdown_content": {
+                    "type": "string",
+                    "description": "The complete beat book in Markdown format.",
                 },
-                "required": ["markdown_content", "filename"],
+                "filename": {
+                    "type": "string",
+                    "description": "Filename for the beat book (e.g. 'sports_beat_book.md').",
+                },
             },
+            "required": ["markdown_content", "filename"],
         },
     },
 ]
@@ -382,30 +366,9 @@ TOOL_DESCRIPTIONS = {
 }
 
 
-def _assistant_message_dict(msg) -> dict:
-    """Convert an OpenAI ChatCompletionMessage into a dict the next request
-    can use. Preserves tool_calls verbatim so the API accepts the next turn."""
-    out: dict = {"role": "assistant"}
-    # content must be present even if null when tool_calls are set
-    out["content"] = msg.content if msg.content else None
-    if msg.tool_calls:
-        out["tool_calls"] = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments,
-                },
-            }
-            for tc in msg.tool_calls
-        ]
-    return out
-
-
 async def run_agent(
     pipeline_result: PipelineResult,
-    ollama_key: str,
+    anthropic_key: str,
     on_interview: InterviewCallback,
     on_message: MessageCallback,
     on_beat_book: Callable[[str, str], Awaitable[None]],
@@ -416,19 +379,19 @@ async def run_agent(
 
     Args:
         pipeline_result: Output from the embedding/clustering pipeline.
-        ollama_key: Ollama Cloud API key (qwen3.5:397b-cloud).
+        anthropic_key: Anthropic API key (claude-sonnet-4-6).
         on_interview: async callback(question_data) → user's answer string.
         on_message: async callback(text) — sends agent text to the frontend.
         on_beat_book: async callback(filename, markdown) — saves/delivers the beat book.
         on_tool_status: async callback(tool_name, detail) — reports tool execution status.
     """
-    client = chat_client(ollama_key)
+    client = chat_client(anthropic_key)
 
     n_stories = len(pipeline_result.stories)
     n_topics  = len(pipeline_result.topics)
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+    # Anthropic conversation: `system` is a top-level kwarg, not a message.
+    messages: list[dict] = [
         {
             "role": "user",
             "content": (
@@ -451,58 +414,57 @@ async def run_agent(
     listed_topics: set = set()
     read_indices: set = set()
 
+    thinking_cfg = thinking_param()
+
     MAX_TURNS = 40
-    for turn in range(MAX_TURNS):
-        turn_messages, extra_body = prepare_thinking(messages)
-        create_kwargs = {
-            "model": AGENT_MODEL,
-            "max_tokens": MAX_TOKENS_PER_TURN,
-            "messages": turn_messages,
-            "tools": TOOLS,
-        }
-        if extra_body:
-            create_kwargs["extra_body"] = extra_body
-        response = client.chat.completions.create(**create_kwargs)
+    for _turn in range(MAX_TURNS):
+        # SDK blocks the event loop; offload to a worker thread so the
+        # WebSocket handler stays responsive.
+        response = await asyncio.to_thread(
+            client.messages.create,
+            model=AGENT_MODEL,
+            max_tokens=MAX_TOKENS_PER_TURN,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages,
+            thinking=thinking_cfg,
+        )
 
-        choice = response.choices[0]
-        msg = choice.message
-        finish_reason = choice.finish_reason
+        # Forward any plain-text narration to the frontend (dedup repeats).
+        text_combined = "".join(
+            b.text for b in response.content
+            if getattr(b, "type", None) == "text"
+        ).strip()
+        if text_combined and text_combined != last_message_text:
+            await on_message(text_combined)
+            last_message_text = text_combined
 
-        # Stream the assistant's text content to the frontend (dedup repeats)
-        if msg.content and msg.content.strip():
-            text = msg.content.strip()
-            if text != last_message_text:
-                await on_message(msg.content)
-                last_message_text = text
+        stop_reason = response.stop_reason
 
-        # No tool calls = end of conversation, OR beat book already saved
-        if not msg.tool_calls:
+        # No tool use this turn = end of conversation, or we already wrote
+        # the beat book on the prior turn.
+        if stop_reason != "tool_use":
+            if stop_reason == "max_tokens":
+                await on_message(
+                    "⚠️ The model hit its output limit mid-turn. The beat book "
+                    "may be incomplete. Please try again with a tighter scope."
+                )
             break
         if beat_book_done:
             break
 
-        # If the model was cut off mid tool-call (length limit), the arguments
-        # JSON is almost certainly malformed and the API will reject the
-        # message if we include it. Surface the error and stop instead of
-        # quietly looping.
-        if finish_reason == "length":
-            await on_message(
-                "⚠️ The model hit its output limit mid-tool-call. The beat book "
-                "may be incomplete. Please try again with a tighter scope."
-            )
-            break
+        # Preserve the full assistant content (text + thinking + tool_use)
+        # verbatim so the next request stays coherent.
+        messages.append({"role": "assistant", "content": response.content})
 
-        # Append assistant turn (with tool_calls preserved) so the API can
-        # correlate the upcoming tool result messages.
-        messages.append(_assistant_message_dict(msg))
+        tool_results: list[dict] = []
+        for block in response.content:
+            if getattr(block, "type", None) != "tool_use":
+                continue
 
-        for tc in msg.tool_calls:
-            tool_name = tc.function.name
-            tool_id = tc.id
-            try:
-                tool_input = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                tool_input = {}
+            tool_name = block.name
+            tool_id = block.id
+            tool_input = block.input or {}
 
             # Report tool status to the frontend
             if on_tool_status:
@@ -561,11 +523,14 @@ async def run_agent(
                 )
                 content_str = f"{content_str}\n\n{progress}"
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_id,
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_id,
                 "content": content_str,
             })
+
+        if tool_results:
+            messages.append({"role": "user", "content": tool_results})
 
     if not beat_book_done:
         await on_message("✅ Agent session complete.")

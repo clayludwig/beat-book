@@ -7,12 +7,10 @@ Reusable module — called by the web app after file upload.
 Returns a PipelineResult with stories, topics, and helper lookups.
 """
 
-import json
 import hashlib
 import pickle
-import math
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple, Callable
 from tqdm import tqdm
 import numpy as np
@@ -24,19 +22,21 @@ from openai import OpenAI
 import umap
 import hdbscan
 
-from ollama_client import CHAT_MODEL, chat_client, prepare_thinking
+from claude_client import CHAT_MODEL, chat_client, thinking_param
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Embeddings stay on OpenAI: Ollama Cloud has no embedding models, and we want
-# this to run anywhere without requiring a local Ollama daemon.
+# Embeddings stay on OpenAI: Anthropic doesn't host an embedding API, and we
+# want this to run anywhere without requiring a local model.
 EMBED_MODEL = "text-embedding-3-small"
 LABEL_MODEL = CHAT_MODEL
 CACHE_DIR   = Path(".cache")
 SAMPLE_SIZE_FOR_LABEL = 8
 EMBED_BATCH_SIZE = 100
+# Labels are 2–5 words; 256 leaves plenty of room with extended thinking off.
+LABEL_MAX_TOKENS = 256
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RESULT DATACLASS
@@ -207,7 +207,7 @@ def _assign_outliers(reduced: np.ndarray, labels: np.ndarray) -> np.ndarray:
     return labels
 
 
-def _label_cluster(client: OpenAI, stories: List[dict], indices: List[int], reduced: np.ndarray) -> str:
+def _label_cluster(client, stories: List[dict], indices: List[int], reduced: np.ndarray) -> str:
     cluster_vecs = reduced[indices]
     centroid     = cluster_vecs.mean(axis=0)
     dists        = np.linalg.norm(cluster_vecs - centroid, axis=1)
@@ -233,15 +233,17 @@ def _label_cluster(client: OpenAI, stories: List[dict], indices: List[int], redu
         "'Immigration Policy', 'Crime and Sentencing', 'City Council', 'Transit'."
     )
 
-    messages, extra_body = prepare_thinking([{"role": "user", "content": prompt}])
-    create_kwargs = {
-        "model": LABEL_MODEL,
-        "messages": messages,
-    }
-    if extra_body:
-        create_kwargs["extra_body"] = extra_body
-    resp = client.chat.completions.create(**create_kwargs)
-    return resp.choices[0].message.content.strip().strip('"').strip("'")
+    resp = client.messages.create(
+        model=LABEL_MODEL,
+        max_tokens=LABEL_MAX_TOKENS,
+        messages=[{"role": "user", "content": prompt}],
+        thinking=thinking_param(),
+    )
+    text = "".join(
+        b.text for b in resp.content
+        if getattr(b, "type", None) == "text"
+    )
+    return text.strip().strip('"').strip("'")
 
 
 def _label_all(client, stories, labels, reduced, level_name, on_progress=None):
@@ -261,19 +263,18 @@ def _label_all(client, stories, labels, reduced, level_name, on_progress=None):
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_pipeline(stories: List[dict], openai_key: str, ollama_key: str,
+def run_pipeline(stories: List[dict], openai_key: str, anthropic_key: str,
                  on_progress: Optional[ProgressCallback] = None) -> PipelineResult:
     """Full pipeline: embed \u2192 reduce \u2192 cluster \u2192 label \u2192 return PipelineResult.
 
-    Embeds via OpenAI (text-embedding-3-small); labels via Ollama Cloud
-    (qwen3.5:397b-cloud).
+    Embeds via OpenAI (text-embedding-3-small); labels via Claude Sonnet 4.6.
     """
     def _p(step, frac, detail=""):
         if on_progress:
             on_progress(step, frac, detail)
 
     embed_clt = OpenAI(api_key=openai_key)
-    chat_clt  = chat_client(ollama_key)
+    chat_clt  = chat_client(anthropic_key)
 
     _p("embedding", 0.0, f"Generating embeddings for {len(stories)} stories\u2026")
     texts   = [_story_to_text(s) for s in stories]

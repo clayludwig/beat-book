@@ -33,7 +33,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from anthropic import Anthropic
 
-from ollama_client import thinking_enabled
+from claude_client import thinking_enabled
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG

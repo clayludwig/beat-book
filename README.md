@@ -32,9 +32,9 @@ Originally built around [Chicago Public Media](https://chicago.suntimes.com/) st
 ## How It Works
 
 1. **Add sources** — Upload files (Word, PDF, HTML, markdown, plain text, JSON, RTF) or paste URLs through a drag-and-drop web interface.
-2. **Detect stories** — The server extracts text from each source and asks an Ollama-hosted model (`qwen3.5:397b-cloud`) to identify distinct news stories, splitting multi-story documents and inferring missing metadata. The reporter reviews the detected stories on a preview screen and can edit titles/dates/authors or deselect anything before continuing.
+2. **Detect stories** — The server extracts text from each source and asks Claude Sonnet 4.6 (`claude-sonnet-4-6`) to identify distinct news stories, splitting multi-story documents and inferring missing metadata. The reporter reviews the detected stories on a preview screen and can edit titles/dates/authors or deselect anything before continuing.
 3. **Analyze** — The server runs each confirmed story through an NLP pipeline: embed the text (OpenAI `text-embedding-3-small`), reduce dimensions, cluster into topics at two granularities (broad and specific), and label each cluster with an LLM.
-4. **Interview** — An Ollama-powered AI agent connects over WebSocket, explores the discovered topics, and asks the reporter 3–5 targeted questions about their beat, audience, and goals.
+4. **Interview** — A Claude-powered AI agent connects over WebSocket, explores the discovered topics, and asks the reporter 3–5 targeted questions about their beat, audience, and goals.
 5. **Generate** — The agent synthesizes everything — topics, article content, and reporter answers — into a polished Markdown beat book with sources, story ideas, context, and reporting tips. A second research agent (Claude Opus 4.7) then enriches the draft with public web research.
 
 ---
@@ -48,20 +48,20 @@ Browser (static HTML/JS/CSS)
     │       │                   stories out (preview JSON)
     │       │
     │       └── ingest.py     → extract_text(...) → markitdown / stdlib
-    │                           normalize(...)    → Ollama qwen3.5:397b-cloud
+    │                           normalize(...)    → Claude Sonnet 4.6
     │
     ├── POST /process         → streams SSE progress events
     │       │
     │       └── pipeline.py   → embed (OpenAI text-embedding-3-small)
-    │                            → UMAP → HDBSCAN → LLM label (qwen3.5)
+    │                            → UMAP → HDBSCAN → LLM label (Sonnet 4.6)
     │
     └── WS /ws/{session_id}   → bidirectional agent conversation
             │
-            └── agent.py      → Ollama tool-use loop
+            └── agent.py      → Claude tool-use loop
                                (reads topics/stories, interviews user, writes beat book)
 ```
 
-The app server is **FastAPI** running on **Uvicorn**. Ingestion and pipeline work both run in a thread pool so the async server stays responsive. The agent conversation happens over a WebSocket, allowing real-time back-and-forth between the Ollama-backed agent and the reporter's browser.
+The app server is **FastAPI** running on **Uvicorn**. Ingestion and pipeline work both run in a thread pool so the async server stays responsive. The agent conversation happens over a WebSocket, allowing real-time back-and-forth between the Claude-backed agent and the reporter's browser.
 
 ---
 
@@ -90,9 +90,9 @@ Dispatches on file extension. Office documents and PDFs are written to a temp fi
 
 ### Stage 2: LLM Normalization
 
-**Function:** `normalize(text, source_label, ollama_key) -> list[Story]`
+**Function:** `normalize(text, source_label, anthropic_key) -> list[Story]`
 
-A single Ollama **qwen3.5:397b-cloud** call with strict tool-use schema. The LLM:
+A single Claude **Sonnet 4.6** call with forced tool-use (`tool_choice={"type":"tool","name":"register_stories"}`). The LLM:
 
 1. Decides whether the document contains news content. If not (meeting notes, invoices, raw data dumps), returns an empty story list with a `skip_reason`.
 2. Identifies each distinct news story in the document — a single file can produce multiple stories, e.g. a notebook of pasted articles.
@@ -126,7 +126,7 @@ These text blocks are sent to the **OpenAI Embeddings API** in batches of 100.
 
 **Tech:** OpenAI Python SDK (`openai`), NumPy for vector storage.
 
-> **Why not Ollama for embeddings?** Ollama Cloud does not host embedding models — all of Ollama's embedding models are local-only. Since this project is meant to run anywhere without a local daemon, embeddings use OpenAI. If you want to run embeddings on your own infrastructure, point an `OpenAI` client at a remote Ollama server hosting `mxbai-embed-large` and switch the model name; the rest of the pipeline is unchanged.
+> **Why not Anthropic for embeddings?** Anthropic doesn't host an embedding API. OpenAI's `text-embedding-3-small` is small, fast, and cheap at this scale. If you'd rather embed on your own infrastructure, point an `OpenAI` client at a remote Ollama server hosting `mxbai-embed-large` and switch the model name; the rest of the pipeline is unchanged.
 
 ### 2. Dimensionality Reduction
 
@@ -172,12 +172,12 @@ Each cluster gets a human-readable topic label generated by an LLM:
 2. Their headlines and a 30-word excerpt are formatted into a prompt.
 3. The LLM is asked to return a concise 2-5 word topic label describing the shared subject matter (e.g. "High School Basketball", "City Budget Disputes", "Immigration Policy").
 
-- **Model:** `qwen3.5:397b-cloud` via Ollama Cloud (configurable in `ollama_client.py`)
+- **Model:** `claude-sonnet-4-6` via the Anthropic API (configurable in `claude_client.py`)
 - **Prompt engineering:** The prompt explicitly instructs the model to focus on *what* the articles are about, not *where* they're from, to avoid generic geographic labels.
 
 This runs once for broad clusters and once for specific clusters.
 
-**Tech:** Ollama Cloud via OpenAI-compatible chat completions API.
+**Tech:** Anthropic Python SDK (`anthropic`) — `client.messages.create`.
 
 ---
 
@@ -185,7 +185,7 @@ This runs once for broad clusters and once for specific clusters.
 
 **File:** `agent.py`
 
-After the pipeline finishes, the reporter's browser opens a WebSocket connection and an Ollama-powered agent takes over. The agent uses [OpenAI-compatible tool calling](https://platform.openai.com/docs/guides/function-calling) (which Ollama implements on `/v1/chat/completions`) to interact with the pipeline results and the reporter.
+After the pipeline finishes, the reporter's browser opens a WebSocket connection and a Claude-powered agent takes over. The agent uses Anthropic's [tool use](https://docs.claude.com/en/docs/agents-and-tools/tool-use/overview) on `messages.create` to interact with the pipeline results and the reporter.
 
 ### Agent Tools
 
@@ -209,10 +209,10 @@ After the pipeline finishes, the reporter's browser opens a WebSocket connection
 
 The loop runs for up to 40 turns. The loop exits when the beat book is saved, the model stops calling tools, or it hits the per-turn output cap mid-tool-call (in which case it surfaces an error rather than risk a malformed continuation).
 
-- **Model:** `qwen3.5:397b-cloud` via Ollama Cloud
+- **Model:** `claude-sonnet-4-6` via the Anthropic API
 - **Max tokens per turn:** 32,768
 
-**Tech:** OpenAI Python SDK (`openai`) pointed at `https://ollama.com/v1`, async/await for WebSocket communication.
+**Tech:** Anthropic Python SDK (`anthropic`), async/await for WebSocket communication.
 
 ---
 
@@ -252,13 +252,13 @@ The frontend is a single-page app with four screens:
 | **Web server** | [FastAPI](https://fastapi.tiangolo.com/) + [Uvicorn](https://www.uvicorn.org/) | Async HTTP + WebSocket server |
 | **File extraction** | [markitdown](https://github.com/microsoft/markitdown) | Convert docx / pdf / html / pptx / xlsx / rtf to markdown |
 | **URL fetching** | [httpx](https://www.python-httpx.org/) | Fetch URLs with SSRF protection (private IPs blocked) |
-| **Story normalization** | [Ollama Cloud](https://ollama.com/) (`qwen3.5:397b-cloud`) | Tool-use call that splits documents into stories and infers title/date/author |
-| **Embeddings** | [OpenAI API](https://platform.openai.com/docs/guides/embeddings) (`text-embedding-3-small`) | Convert article text to 1536-d vectors. (Ollama Cloud has no embedding models.) |
+| **Story normalization** | [Anthropic API](https://docs.claude.com/) (`claude-sonnet-4-6`) | Tool-use call that splits documents into stories and infers title/date/author |
+| **Embeddings** | [OpenAI API](https://platform.openai.com/docs/guides/embeddings) (`text-embedding-3-small`) | Convert article text to 1536-d vectors. (Anthropic has no embedding API.) |
 | **Dimensionality reduction** | [UMAP](https://umap-learn.readthedocs.io/) | Project embeddings to lower dimensions for clustering |
 | **Clustering** | [HDBSCAN](https://hdbscan.readthedocs.io/) | Density-based topic discovery at two granularities |
-| **Topic labeling** | [Ollama Cloud](https://ollama.com/) (`qwen3.5:397b-cloud`) | Generate human-readable labels for each cluster |
-| **Agent** | [Ollama Cloud](https://ollama.com/) (`qwen3.5:397b-cloud`) | Tool-using agent for interview and beat book generation |
-| **Research agent** | [Anthropic API](https://docs.anthropic.com/) (`claude-opus-4-7`) | Public-web research over the draft beat book |
+| **Topic labeling** | [Anthropic API](https://docs.claude.com/) (`claude-sonnet-4-6`) | Generate human-readable labels for each cluster |
+| **Agent** | [Anthropic API](https://docs.claude.com/) (`claude-sonnet-4-6`) | Tool-using agent for interview and beat book generation |
+| **Research agent** | [Anthropic API](https://docs.claude.com/) (`claude-opus-4-7`) | Public-web research over the draft beat book |
 | **Numerical** | [NumPy](https://numpy.org/), [SciPy](https://scipy.org/), [scikit-learn](https://scikit-learn.org/) | Vector math, distance calculations, preprocessing |
 | **Frontend** | Vanilla HTML/CSS/JS | No-framework single-page app |
 
@@ -270,8 +270,7 @@ The frontend is a single-page app with four screens:
 
 - Python 3.9+
 - An [OpenAI API key](https://platform.openai.com/api-keys) (used only for embeddings — `text-embedding-3-small`)
-- An [Ollama Cloud API key](https://ollama.com/) (used for `qwen3.5:397b-cloud` — story normalization, cluster labeling, and the interview agent)
-- An [Anthropic API key](https://console.anthropic.com/) (used only by the research agent — Claude Opus 4.7)
+- An [Anthropic API key](https://console.anthropic.com/) (used for `claude-sonnet-4-6` — story normalization, cluster labeling, the interview agent — and `claude-opus-4-7` for the research agent)
 
 No local daemons required — everything runs through hosted APIs, so the project is portable across machines.
 
@@ -287,14 +286,13 @@ Create a `.env` file in the project root:
 
 ```
 OPENAI_API_KEY=sk-...
-OLLAMA_API_KEY=...
 ANTHROPIC_API_KEY=sk-ant-...
 
-# Optional — default is https://ollama.com/v1
-# OLLAMA_CHAT_BASE_URL=https://ollama.com/v1
+# Optional — extended thinking on Sonnet 4.6 (slower, higher quality).
+# Default: off. Ignored by the ingest normalization step, which forces
+# tool_choice and is incompatible with thinking.
+# ENABLE_THINKING=true
 ```
-
-If you'd rather run the chat model on your own Ollama instance (local or remote), point `OLLAMA_CHAT_BASE_URL` at it and `ollama pull` a chat-capable model that fits your hardware. The `OLLAMA_API_KEY` value is ignored by self-hosted Ollama.
 
 ### Run
 
@@ -313,8 +311,8 @@ beat-book/
 ├── app.py                  # FastAPI server — /ingest, /process, WebSocket
 ├── ingest.py               # Multi-format extraction + LLM normalization
 ├── pipeline.py             # NLP pipeline — embedding, UMAP, HDBSCAN, LLM labeling
-├── agent.py                # Ollama agent — tool definitions, system prompt, agent loop
-├── ollama_client.py        # Shared Ollama config — model names + base URLs
+├── agent.py                # Claude agent — tool definitions, system prompt, agent loop
+├── claude_client.py        # Shared Anthropic config — model name + client factory
 ├── research_agent.py       # Sandboxed research agent that revises the draft beat book
 ├── citation_matcher.py     # Matches beat-book claims back to source sentences
 ├── requirements.txt        # Python dependencies

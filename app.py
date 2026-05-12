@@ -19,7 +19,7 @@ import os
 import queue
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
@@ -51,8 +51,8 @@ from ingest import ingest_file, ingest_url
 app = FastAPI(title="Beat Book Builder")
 
 # Cap on concurrent LLM normalization calls per /ingest request.
-# Keep low so we don't slam the Ollama Cloud endpoint — typical ingest
-# requests are a handful of sources.
+# Keep low so we don't slam the Anthropic API — typical ingest requests
+# are a handful of sources.
 _INGEST_CONCURRENCY = 2
 
 # In-memory session store: session_id → PipelineResult
@@ -94,10 +94,10 @@ async def ingest(
     """Run multi-format extraction + LLM normalization on uploaded files
     and/or URLs. Returns a preview of detected stories per source — the
     frontend reviews/edits, then POSTs the confirmed list to /process."""
-    ollama_key = os.environ.get("OLLAMA_API_KEY", "")
-    if not ollama_key:
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not anthropic_key:
         return JSONResponse(
-            {"error": "OLLAMA_API_KEY not configured."}, status_code=500
+            {"error": "ANTHROPIC_API_KEY not configured."}, status_code=500
         )
 
     url_list = [u.strip() for u in urls.splitlines() if u.strip()]
@@ -121,13 +121,13 @@ async def ingest(
     async def run_file(name: str, raw: bytes):
         async with semaphore:
             return await loop.run_in_executor(
-                None, ingest_file, name, raw, ollama_key
+                None, ingest_file, name, raw, anthropic_key
             )
 
     async def run_url(url: str):
         async with semaphore:
             return await loop.run_in_executor(
-                None, ingest_url, url, ollama_key
+                None, ingest_url, url, anthropic_key
             )
 
     tasks = [run_file(name, raw) for name, raw in buffered_files]
@@ -167,9 +167,9 @@ async def process(body: ProcessRequest):
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     if not openai_key:
         return JSONResponse({"error": "OPENAI_API_KEY not configured (used for embeddings)."}, status_code=500)
-    ollama_key = os.environ.get("OLLAMA_API_KEY", "")
-    if not ollama_key:
-        return JSONResponse({"error": "OLLAMA_API_KEY not configured (used for cluster labeling)."}, status_code=500)
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not anthropic_key:
+        return JSONResponse({"error": "ANTHROPIC_API_KEY not configured (used for cluster labeling)."}, status_code=500)
 
     progress_queue: queue.Queue = queue.Queue()
 
@@ -179,7 +179,7 @@ async def process(body: ProcessRequest):
     async def event_stream():
         loop = asyncio.get_event_loop()
         future = loop.run_in_executor(
-            None, run_pipeline, stories, openai_key, ollama_key, on_progress
+            None, run_pipeline, stories, openai_key, anthropic_key, on_progress
         )
 
         while not future.done():
@@ -233,16 +233,9 @@ async def agent_ws(ws: WebSocket, session_id: str):
         await ws.close()
         return
 
-    ollama_key = os.environ.get("OLLAMA_API_KEY", "")
-    if not ollama_key:
-        await ws.send_json({"type": "error", "text": "OLLAMA_API_KEY not configured."})
-        await ws.close()
-        return
-
-    # research_agent still uses Anthropic Opus (the only frontier-model holdover).
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not anthropic_key:
-        await ws.send_json({"type": "error", "text": "ANTHROPIC_API_KEY not configured (needed for the research agent)."})
+        await ws.send_json({"type": "error", "text": "ANTHROPIC_API_KEY not configured."})
         await ws.close()
         return
 
@@ -361,7 +354,7 @@ async def agent_ws(ws: WebSocket, session_id: str):
             "filename": filename,
         })
 
-        # Citation matching uses OpenAI embeddings (Ollama Cloud has no embedding models).
+        # Citation matching uses OpenAI embeddings (Anthropic has no embedding API).
         openai_key = os.environ.get("OPENAI_API_KEY", "")
         if not openai_key:
             await ws.send_json({
@@ -440,7 +433,7 @@ async def agent_ws(ws: WebSocket, session_id: str):
     try:
         await run_agent(
             pipeline_result=pipeline_result,
-            ollama_key=ollama_key,
+            anthropic_key=anthropic_key,
             on_interview=on_interview,
             on_message=on_message,
             on_beat_book=on_beat_book,

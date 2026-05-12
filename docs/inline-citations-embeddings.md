@@ -182,7 +182,7 @@ A few things made this the right shape, given the constraints:
 
 - **No vector database.** A FAISS or LanceDB index would let you scale to millions of sentences, but the corpus per beat book is hundreds to low thousands. Brute-force search over a Python list of dicts is fast enough that the cost of the dependency would dwarf the cost of the search.
 - **Sentence-level rather than paragraph-level.** The viewer wants to highlight the specific claim, not the whole bullet. A paragraph-level approach would over-attribute.
-- **OpenAI's small embedding model rather than a local one or an Ollama-hosted one.** Ollama Cloud — which hosts the project's chat slots — does not offer any embedding models, only chat. A self-hosted Ollama with `mxbai-embed-large` would work, but the project is meant to run anywhere without a local daemon, so a hosted embedding API was the only path that wouldn't bind a fresh checkout to a particular machine. The marginal cost of `text-embedding-3-small` at this scale is too low to argue with.
+- **OpenAI's small embedding model rather than a local one.** Anthropic — which hosts the project's chat slots — does not offer an embedding API, only chat. A self-hosted Ollama with `mxbai-embed-large` would work, but the project is meant to run anywhere without a local daemon, so a hosted embedding API was the only path that wouldn't bind a fresh checkout to a particular machine. The marginal cost of `text-embedding-3-small` at this scale is too low to argue with.
 - **Threshold in the viewer, not the matcher.** Keeps the underlying JSON debuggable and tweak-able without re-running embeddings.
 
 ## How this stage cohabits with the research agent

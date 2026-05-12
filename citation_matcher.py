@@ -21,7 +21,7 @@ from openai import OpenAI
 # Progress callback signature: (stage_label, fraction_0_to_1, detail)
 ProgressCallback = Callable[[str, float, str], None]
 
-# Ollama Cloud has no embedding models, so embeddings stay on OpenAI.
+# Anthropic doesn't host an embedding API, so embeddings stay on OpenAI.
 EMBED_MODEL = "text-embedding-3-small"
 # The API accepts up to 2048 inputs per request, but we cap lower to keep
 # individual HTTP payloads reasonable.

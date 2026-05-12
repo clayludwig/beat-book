@@ -8,13 +8,13 @@ Two stages:
    Format dispatcher. markitdown handles docx/pdf/html/pptx/xlsx/rtf.
    stdlib handles txt/md/json. Unknown extensions get a utf-8 best-effort.
 
-2. normalize(text, source_label, ollama_key) → list[Story]
-   Ollama Cloud (qwen3.5:397b-cloud) tool-use call with a strict schema.
-   Documents that fit in one window get a single call; larger documents are
-   split into overlapping windows, processed concurrently, and deduplicated
-   on merge. The LLM only infers metadata (title/date/author) and returns
-   verbatim markers for each story's body — the body itself is sliced from
-   the original text, never LLM-rewritten.
+2. normalize(text, source_label, anthropic_key) → list[Story]
+   Claude Sonnet 4.6 tool-use call with a strict schema. Documents that fit
+   in one window get a single call; larger documents are split into
+   overlapping windows, processed concurrently, and deduplicated on merge.
+   The LLM only infers metadata (title/date/author) and returns verbatim
+   markers for each story's body — the body itself is sliced from the
+   original text, never LLM-rewritten.
 
 A wrapper, ingest_source(), runs both stages and packages the result for
 the /ingest route.
@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import html
-import io
 import ipaddress
 import json
 import logging
@@ -38,7 +37,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from ollama_client import CHAT_MODEL, chat_client, prepare_thinking
+from claude_client import CHAT_MODEL, chat_client
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +49,11 @@ MAX_FILE_BYTES = 25 * 1024 * 1024            # 25 MB per file
 URL_FETCH_TIMEOUT = 15.0                     # seconds
 URL_USER_AGENT = "BeatBookBuilder/1.0 (+https://github.com/clayludwig/beat-book)"
 NORMALIZE_MODEL = CHAT_MODEL
-# Max tokens per LLM call. Has to cover both internal thinking tokens (Qwen
-# burns a lot) and the actual tool-call response (marker data for up to ~30
-# stories per chunk).
+# Max tokens per LLM call. Sized to fit marker data for up to ~30 stories
+# per chunk.
 NORMALIZE_MAX_TOKENS = 32768
-# Number of attempts per chunk when the model returns no tool call. Qwen's
-# tool_choice compliance is not 100%; one retry recovers most cases.
+# Number of attempts per chunk when the model returns no tool call. With
+# tool_choice forced this should be rare, but one retry covers transients.
 NORMALIZE_MAX_ATTEMPTS = 2
 
 # Chunked normalization: documents over WINDOW_SIZE get split into overlapping
@@ -415,76 +413,73 @@ def fetch_url(url: str) -> Tuple[str, bytes]:
 
 
 _NORMALIZE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "register_stories",
-        "description": (
-            "Register the news stories you found in the document. "
-            "Return is_news_content=false when the document is not news content "
-            "(e.g., reporter notes, invoices, transcripts of meetings) — in that "
-            "case return an empty stories list and explain in skip_reason."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "is_news_content": {
-                    "type": "boolean",
-                    "description": "True if the document contains at least one news article or substantive story-like piece of journalism.",
-                },
-                "skip_reason": {
-                    "type": "string",
-                    "description": "If is_news_content is false, one short sentence explaining what the document looks like instead. Empty otherwise.",
-                },
-                "stories": {
-                    "type": "array",
-                    "description": "One entry per distinct news story in the document. Split multi-story documents (e.g., a notebook with several articles). Leave empty if is_news_content is false.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "title": {
-                                "type": "string",
-                                "description": "The story's headline. If no headline is present, write a 6-10 word descriptive title.",
-                            },
-                            "date": {
-                                "type": "string",
-                                "description": "Publication date as YYYY-MM-DD. Empty string if not present in the document.",
-                            },
-                            "author": {
-                                "type": "string",
-                                "description": "Byline author. Empty string if not present. Do not put the publication name here.",
-                            },
-                            "link": {
-                                "type": "string",
-                                "description": "Source URL if present in the document. Empty string otherwise.",
-                            },
-                            "body_starts_with": {
-                                "type": "string",
-                                "description": "The first 30-80 characters of this story's body — COPIED VERBATIM from the document. This must appear exactly in the document so the server can locate the body's beginning. Start with the first sentence of the article body itself, not the title or byline.",
-                            },
-                            "body_ends_with": {
-                                "type": "string",
-                                "description": "The last 30-80 characters of this story's body — COPIED VERBATIM from the document. This must appear exactly in the document so the server can locate the body's end.",
-                            },
-                            "confidence": {
-                                "type": "string",
-                                "enum": ["high", "medium", "low"],
-                                "description": "high = metadata is explicit in the text. medium = metadata is reasonably inferred. low = metadata is a guess.",
-                            },
-                            "reasoning": {
-                                "type": "string",
-                                "description": "One sentence explaining how you identified this as a story and where the metadata came from.",
-                            },
+    "name": "register_stories",
+    "description": (
+        "Register the news stories you found in the document. "
+        "Return is_news_content=false when the document is not news content "
+        "(e.g., reporter notes, invoices, transcripts of meetings) — in that "
+        "case return an empty stories list and explain in skip_reason."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "is_news_content": {
+                "type": "boolean",
+                "description": "True if the document contains at least one news article or substantive story-like piece of journalism.",
+            },
+            "skip_reason": {
+                "type": "string",
+                "description": "If is_news_content is false, one short sentence explaining what the document looks like instead. Empty otherwise.",
+            },
+            "stories": {
+                "type": "array",
+                "description": "One entry per distinct news story in the document. Split multi-story documents (e.g., a notebook with several articles). Leave empty if is_news_content is false.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "The story's headline. If no headline is present, write a 6-10 word descriptive title.",
                         },
-                        "required": [
-                            "title", "date", "author", "link",
-                            "body_starts_with", "body_ends_with",
-                            "confidence", "reasoning",
-                        ],
+                        "date": {
+                            "type": "string",
+                            "description": "Publication date as YYYY-MM-DD. Empty string if not present in the document.",
+                        },
+                        "author": {
+                            "type": "string",
+                            "description": "Byline author. Empty string if not present. Do not put the publication name here.",
+                        },
+                        "link": {
+                            "type": "string",
+                            "description": "Source URL if present in the document. Empty string otherwise.",
+                        },
+                        "body_starts_with": {
+                            "type": "string",
+                            "description": "The first 30-80 characters of this story's body — COPIED VERBATIM from the document. This must appear exactly in the document so the server can locate the body's beginning. Start with the first sentence of the article body itself, not the title or byline.",
+                        },
+                        "body_ends_with": {
+                            "type": "string",
+                            "description": "The last 30-80 characters of this story's body — COPIED VERBATIM from the document. This must appear exactly in the document so the server can locate the body's end.",
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["high", "medium", "low"],
+                            "description": "high = metadata is explicit in the text. medium = metadata is reasonably inferred. low = metadata is a guess.",
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "One sentence explaining how you identified this as a story and where the metadata came from.",
+                        },
                     },
+                    "required": [
+                        "title", "date", "author", "link",
+                        "body_starts_with", "body_ends_with",
+                        "confidence", "reasoning",
+                    ],
                 },
             },
-            "required": ["is_news_content", "skip_reason", "stories"],
         },
+        "required": ["is_news_content", "skip_reason", "stories"],
     },
 }
 
@@ -640,7 +635,7 @@ def _dedup_key(story: Story) -> str:
 def _normalize_chunk(
     text: str,
     source_label: str,
-    ollama_key: str,
+    anthropic_key: str,
     *,
     link_hint: str = "",
     allow_full_doc_fallback: bool = True,
@@ -652,7 +647,7 @@ def _normalize_chunk(
     that story's body. Safe only for whole-document calls; in chunked mode
     it would splice in content from adjacent stories.
     """
-    client = chat_client(ollama_key)
+    client = chat_client(anthropic_key)
 
     user_prefix = f"Source label: {source_label}\n"
     if link_hint:
@@ -661,35 +656,32 @@ def _normalize_chunk(
     user_prefix += "----- BEGIN DOCUMENT -----\n"
     user_suffix = "\n----- END DOCUMENT -----"
 
-    tool_call = None
+    tool_use_block = None
     for attempt in range(NORMALIZE_MAX_ATTEMPTS):
         try:
-            messages, extra_body = prepare_thinking([
-                {"role": "system", "content": _NORMALIZE_SYSTEM},
-                {"role": "user", "content": user_prefix + text + user_suffix},
-            ])
-            create_kwargs = {
-                "model": NORMALIZE_MODEL,
-                "max_tokens": NORMALIZE_MAX_TOKENS,
-                "messages": messages,
-                "tools": [_NORMALIZE_TOOL],
-                "tool_choice": {"type": "function", "function": {"name": "register_stories"}},
-            }
-            if extra_body:
-                create_kwargs["extra_body"] = extra_body
-            resp = client.chat.completions.create(**create_kwargs)
+            # Extended thinking is incompatible with forced tool_choice, so
+            # we don't pass a `thinking` parameter here — the API treats
+            # omission as disabled, which is what we want for this call.
+            resp = client.messages.create(
+                model=NORMALIZE_MODEL,
+                max_tokens=NORMALIZE_MAX_TOKENS,
+                system=_NORMALIZE_SYSTEM,
+                messages=[
+                    {"role": "user", "content": user_prefix + text + user_suffix},
+                ],
+                tools=[_NORMALIZE_TOOL],
+                tool_choice={"type": "tool", "name": "register_stories"},
+            )
         except Exception as e:
             raise IngestError(
                 f"{source_label}: LLM normalization failed — {type(e).__name__}: {e}"
             ) from e
 
-        msg = resp.choices[0].message
-        tool_calls = msg.tool_calls or []
-        tool_call = next(
-            (tc for tc in tool_calls if tc.function and tc.function.name == "register_stories"),
+        tool_use_block = next(
+            (b for b in resp.content if getattr(b, "type", None) == "tool_use"),
             None,
         )
-        if tool_call is not None:
+        if tool_use_block is not None:
             break
         if attempt + 1 < NORMALIZE_MAX_ATTEMPTS:
             logger.warning(
@@ -697,26 +689,20 @@ def _normalize_chunk(
                 source_label, attempt + 1, NORMALIZE_MAX_ATTEMPTS,
             )
 
-    if tool_call is None:
+    if tool_use_block is None:
         raise IngestError(
             f"{source_label}: LLM did not return structured stories after "
             f"{NORMALIZE_MAX_ATTEMPTS} attempts."
         )
 
-    try:
-        payload = json.loads(tool_call.function.arguments or "{}")
-    except json.JSONDecodeError as e:
-        raise IngestError(
-            f"{source_label}: LLM returned invalid tool-call JSON — {e}"
-        ) from e
+    payload = tool_use_block.input if isinstance(tool_use_block.input, dict) else {}
 
     is_news = bool(payload.get("is_news_content", False))
     skip_reason = (payload.get("skip_reason") or "").strip()
     raw_stories = payload.get("stories") or []
 
-    # Filter out malformed entries before we touch them. Qwen 3.5 in /no_think
-    # mode occasionally emits string entries (or other non-dicts) inside the
-    # stories array, which would crash the marker-resolution loop below.
+    # Drop non-dict entries defensively — strict tool-use should prevent this
+    # but it's cheap insurance against a malformed input matching the schema.
     dropped_malformed = sum(1 for r in raw_stories if not isinstance(r, dict))
     if dropped_malformed:
         logger.warning(
@@ -794,14 +780,14 @@ def _normalize_chunk(
 def normalize(
     text: str,
     source_label: str,
-    ollama_key: str,
+    anthropic_key: str,
     *,
     link_hint: str = "",
 ) -> Tuple[list[Story], bool, str]:
-    """Stage 2. Run extracted text through Ollama Cloud to produce structured
-    stories. Single LLM call for documents that fit in one window; for larger
-    documents, fan out into overlapping windows processed concurrently and
-    deduplicate on merge.
+    """Stage 2. Run extracted text through Claude Sonnet 4.6 to produce
+    structured stories. Single LLM call for documents that fit in one window;
+    for larger documents, fan out into overlapping windows processed
+    concurrently and deduplicate on merge.
 
     Returns (stories, is_news_content, skip_reason).
     """
@@ -810,7 +796,7 @@ def normalize(
 
     if len(text) <= WINDOW_SIZE:
         return _normalize_chunk(
-            text, source_label, ollama_key,
+            text, source_label, anthropic_key,
             link_hint=link_hint,
             allow_full_doc_fallback=True,
         )
@@ -832,7 +818,7 @@ def normalize(
     def _process(idx: int) -> Optional[Tuple[list[Story], bool, str]]:
         try:
             return _normalize_chunk(
-                chunks[idx], source_label, ollama_key,
+                chunks[idx], source_label, anthropic_key,
                 link_hint=link_hint,
                 allow_full_doc_fallback=False,
             )
@@ -900,7 +886,7 @@ def normalize(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def ingest_file(filename: str, raw: bytes, ollama_key: str) -> IngestedSource:
+def ingest_file(filename: str, raw: bytes, anthropic_key: str) -> IngestedSource:
     """Run both stages on an uploaded file. Never raises; failure is reported
     via excluded/skip_reason/extract_error on the returned IngestedSource."""
     source = IngestedSource(source_label=filename, kind="file")
@@ -924,7 +910,7 @@ def ingest_file(filename: str, raw: bytes, ollama_key: str) -> IngestedSource:
         return source
 
     try:
-        stories, is_news, skip_reason = normalize(text, filename, ollama_key)
+        stories, is_news, skip_reason = normalize(text, filename, anthropic_key)
     except IngestError as e:
         source.excluded = True
         source.extract_error = str(e)
@@ -938,7 +924,7 @@ def ingest_file(filename: str, raw: bytes, ollama_key: str) -> IngestedSource:
     return source
 
 
-def ingest_url(url: str, ollama_key: str) -> IngestedSource:
+def ingest_url(url: str, anthropic_key: str) -> IngestedSource:
     """Fetch a URL, then run both stages. Same failure semantics as ingest_file."""
     source = IngestedSource(source_label=url, kind="url")
 
@@ -970,7 +956,7 @@ def ingest_url(url: str, ollama_key: str) -> IngestedSource:
 
     try:
         stories, is_news, skip_reason = normalize(
-            text, url, ollama_key, link_hint=url,
+            text, url, anthropic_key, link_hint=url,
         )
     except IngestError as e:
         source.excluded = True
