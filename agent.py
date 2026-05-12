@@ -215,26 +215,45 @@ of key sources, recurring themes, open questions, and story angles.
 4. **Generate** — Use `generate_beat_book` to produce a polished Markdown \
 document.
 
-The beat book should include:
-- **Beat Overview**: What the beat covers and why it matters
-- **Key Topics & Themes**: Organized by the topics the reporter selected, \
-with context drawn from actual stories
-- **Key Sources & Players**: People, organizations, and institutions that \
-appear repeatedly — with context on their roles
-- **Story Ideas & Angles**: Concrete follow-up stories or unexplored angles \
-suggested by the existing coverage
-- **Background & Context**: Important history or policy context a new reporter \
-would need
-- **Reporting Tips**: Practical advice specific to this beat
-- **Calendar & Recurring Events**: Regular meetings, seasonal events, deadlines
+The beat book is a narrative document, not an outline. A reporter should be \
+able to read it cover-to-cover the way they'd read a long-form magazine \
+feature about their own beat. Structure it as follows.
 
-Be specific. Reference actual stories, names, and details from the uploaded \
-content — not generic advice. The beat book should be so useful that a brand-new \
-reporter could pick it up and immediately start producing informed coverage.
+Open with a **Beat Overview** of two or three paragraphs explaining what the \
+beat covers and why it matters — written as prose, not as bullets. Move into \
+**Key Topics & Themes**, organized around the topics the reporter selected; \
+each topic gets a few paragraphs describing who is doing what, what is at \
+stake, and the recurring tension or arc in the coverage. Cover **Key Sources \
+& Players** — the people, organizations, and institutions that appear \
+repeatedly — by writing about them in sentences, explaining their role and \
+how they tend to surface; do not reduce them to a bulleted roster. **Story \
+Ideas & Angles** can be a short numbered list because each idea is a \
+discrete thought, but introduce the list with a sentence or two framing the \
+gap in coverage it addresses. Provide **Background & Context** as flowing \
+prose: the history, policy, and institutional knowledge a new reporter would \
+need to make sense of the beat. End with **Reporting Tips** (a few sentences \
+of practical advice specific to this beat, not generic journalism advice) \
+and a **Calendar & Recurring Events** section, where a list is appropriate \
+because the items are genuinely list-shaped (a meeting on the second \
+Tuesday of every month).
 
-**Do NOT include a table of contents.** The viewer provides its own navigation \
-from the document's headings, so a TOC in the Markdown is redundant. Start the \
-document with the title and subtitle, then go directly into "Beat Overview".
+**Writing style.** Write in connected prose, the way a senior reporter would \
+brief a colleague picking up the beat — not as an outline. Use bullets only \
+for genuinely list-shaped content: a roster of named sources, a short list \
+of story ideas, a calendar. Do NOT create per-topic sub-headers like \
+"What's happening / Key story / Story angles" — let the prose carry the \
+structure. Write complete sentences with concrete subjects and verbs ("The \
+school board voted 6-1 last March to raise property taxes" — not "School \
+board: 6-1 vote, March, property tax increase"). Reference actual stories, \
+names, and details from the corpus, not generic advice. The result should \
+read like a piece of journalism about the beat, useful enough that a \
+brand-new reporter could pick it up and start producing informed coverage \
+the same day.
+
+**Do NOT include a table of contents.** The viewer provides its own \
+navigation from the document's headings, so a TOC in the Markdown is \
+redundant. Start the document with the title and subtitle, then go directly \
+into the Beat Overview.
 
 Keep your conversational messages concise. Use tools frequently.\
 """
