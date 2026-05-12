@@ -19,3 +19,7 @@ output/
 # Scraped source stories
 source-stories-alt/
 source-stories/
+
+# Local size-cap test artifacts
+near_cap_test.txt
+oversize_test.txt
