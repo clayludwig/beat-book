@@ -572,20 +572,37 @@ def _resolve_marker_offset(text: str, marker: str, *, after: int = 0) -> int:
     return -1
 
 
-def _slice_body(text: str, body_starts_with: str, body_ends_with: str) -> str:
-    """Locate the body inside `text` using the LLM's start/end snippets."""
+def _slice_body(
+    text: str,
+    body_starts_with: str,
+    body_ends_with: str,
+    *,
+    upper_bound: Optional[int] = None,
+) -> str:
+    """Locate the body inside `text` using the LLM's start/end snippets.
+
+    `upper_bound`, when set, is the maximum end offset the body may extend
+    to. This is how the caller prevents one story's body from bleeding into
+    the next when the end marker fails to resolve cleanly — the caller knows
+    where the next story starts and passes that as the ceiling.
+    """
     start = _resolve_marker_offset(text, body_starts_with)
     if start < 0:
         return ""
 
+    cap = upper_bound if upper_bound is not None else len(text)
+    cap = min(cap, len(text))
+
     end_marker = (body_ends_with or "").strip()
     end_pos = _resolve_marker_offset(text, end_marker, after=start)
     if end_pos < 0:
-        end = len(text)
+        end = cap
     else:
         end = end_pos + len(end_marker)
-        end = min(end, len(text))
+        end = min(end, cap)
 
+    if end <= start:
+        return ""
     return text[start:end].strip()
 
 
@@ -698,11 +715,34 @@ def _normalize_chunk(
 
     stories: list[Story] = []
     use_full_doc_fallback = allow_full_doc_fallback and len(raw_stories) == 1
+
+    # Pre-resolve every story's start position so each story's body can be
+    # capped at the next story's start. Without this cap, a missing or
+    # too-permissive end marker would silently extend the body into the
+    # next article — a bug that surfaced as bleed-through in saved beat
+    # books (e.g. a "council update" article whose body contained an
+    # adjacent "today in history" column).
+    start_positions: list[int] = []
     for raw in raw_stories:
+        start_positions.append(
+            _resolve_marker_offset(text, raw.get("body_starts_with") or "")
+        )
+    sorted_starts = sorted(s for s in start_positions if s >= 0)
+
+    def _upper_bound_for(start: int) -> int:
+        # First sorted start strictly greater than this story's start.
+        for s in sorted_starts:
+            if s > start:
+                return s
+        return len(text)
+
+    for idx, raw in enumerate(raw_stories):
         body_start = raw.get("body_starts_with") or ""
         body_end = raw.get("body_ends_with") or ""
+        start = start_positions[idx]
+        upper = _upper_bound_for(start) if start >= 0 else None
 
-        content = _slice_body(text, body_start, body_end)
+        content = _slice_body(text, body_start, body_end, upper_bound=upper)
 
         if len(content) < 20 and use_full_doc_fallback:
             logger.warning(

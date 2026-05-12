@@ -170,9 +170,19 @@ If all three strategies fail, the resolver returns `-1` and the body is treated 
 Putting it together, `_slice_body` calls the resolver twice:
 
 1. Find the start. If not found, give up on this story.
-2. Find the end, starting from after the start. If not found, slice to end of document.
+2. Find the end, starting from after the start. If not found, slice to the body's `upper_bound`.
 
-The end-marker miss is more forgiving than the start-marker miss because "this story runs to the end of the file" is a common case — especially for single-article uploads where there is no natural end-of-story signal.
+The `upper_bound` is the **next story's start position**, pre-computed by `_normalize_chunk` before this loop runs:
+
+```python
+start_positions = [_resolve_marker_offset(text, raw["body_starts_with"]) for raw in raw_stories]
+sorted_starts = sorted(s for s in start_positions if s >= 0)
+# For each story, the upper bound is the first sorted_start strictly greater than this story's own start.
+```
+
+Why this matters: an LLM that returns a malformed or unresolvable `body_ends_with` used to cause `_slice_body` to extend the body all the way to end-of-document. In multi-story files that meant one story would absorb every subsequent story's text. The `upper_bound` cap turns "we don't know where this story ends" into "it ends where the next story begins" — a far safer fallback that preserves the natural boundary the LLM already gave us by identifying the next story.
+
+The end-marker miss is still forgiving — a story without a resolved end marker still produces a body, just one bounded by the adjacent story rather than the document. For single-story documents (or the last story in any document), the upper bound is end-of-text, which matches the legacy behavior.
 
 After slicing, the resulting body is filtered: anything shorter than 20 characters is dropped (a sign the markers collided weirdly), and in the single-story-with-no-body case, the full document is substituted.
 
