@@ -227,7 +227,7 @@ def _extract_json(raw: bytes) -> str:
         return text
 
     def render_record(rec: dict, idx: Optional[int] = None) -> str:
-        title = (rec.get("title") or rec.get("headline") or "").strip()
+        title = (rec.get("title") or rec.get("headline") or "").strip() if isinstance(rec.get("title") or rec.get("headline"), str) else ""
         date = (rec.get("date") or rec.get("published") or rec.get("published_parsed") or "").strip() if isinstance(rec.get("date") or rec.get("published") or rec.get("published_parsed"), str) else ""
         author = (rec.get("author") or rec.get("byline") or "").strip() if isinstance(rec.get("author") or rec.get("byline"), str) else ""
         link = (rec.get("link") or rec.get("url") or "").strip() if isinstance(rec.get("link") or rec.get("url"), str) else ""
