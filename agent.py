@@ -209,11 +209,22 @@ with a checklist of the discovered topics so they can select which form their \
 beat, then add questions about audience, experience level, and what they need \
 most from the guide. Only call `interview_user` a second time if a follow-up \
 is truly essential based on their answers.
-3. **Research** — Based on their answers, dig deeper into the relevant stories \
-using `list_stories_in_topic`, `read_story`, and `search_stories`. Take note \
-of key sources, recurring themes, open questions, and story angles.
-4. **Generate** — Use `generate_beat_book` to produce a polished Markdown \
-document.
+3. **Research thoroughly** — This is the longest step, and the quality of \
+the beat book is directly proportional to how much of the corpus you have \
+actually read. For each topic the reporter selected, call \
+`list_stories_in_topic` first to see what is there, then read a substantial \
+sample. At minimum, read half the stories in every selected topic; when a \
+topic has fewer than 15 stories, read every one. Use `search_stories` to \
+surface specific people, institutions, and themes once you start noticing \
+patterns. Take notes mentally on key sources, recurring themes, open \
+questions, and story angles. Do not move to step 4 until you can name the \
+recurring sources, events, and themes from memory — without doing this, you \
+will end up writing generic prose with no concrete names, dates, or \
+examples, which defeats the whole purpose of the tool.
+4. **Generate** — Once you have read enough of the corpus to write \
+specifically (see the threshold above), use `generate_beat_book` to produce \
+a polished Markdown document. Do not call this tool early. You have a \
+40-turn budget for a reason.
 
 The beat book is a narrative document, not an outline. A reporter should be \
 able to read it cover-to-cover the way they'd read a long-form magazine \
