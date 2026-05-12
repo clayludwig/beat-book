@@ -14,8 +14,16 @@ import asyncio
 import json
 from typing import Callable, Awaitable
 
+import anthropic
+
 from pipeline import PipelineResult
-from claude_client import CHAT_MODEL, chat_client, thinking_param
+from claude_client import (
+    CHAT_MODEL,
+    RATE_LIMIT_MAX_RETRIES,
+    RATE_LIMIT_PAUSE_SECONDS,
+    chat_client,
+    thinking_param,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL
@@ -419,16 +427,37 @@ async def run_agent(
     MAX_TURNS = 40
     for _turn in range(MAX_TURNS):
         # SDK blocks the event loop; offload to a worker thread so the
-        # WebSocket handler stays responsive.
-        response = await asyncio.to_thread(
-            client.messages.create,
-            model=AGENT_MODEL,
-            max_tokens=MAX_TOKENS_PER_TURN,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-            thinking=thinking_cfg,
-        )
+        # WebSocket handler stays responsive. If the SDK exhausts its own
+        # 429-retry budget, the outer loop here pauses and tries again
+        # before tearing down the session.
+        response = None
+        for rl_attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+            try:
+                response = await asyncio.to_thread(
+                    client.messages.create,
+                    model=AGENT_MODEL,
+                    max_tokens=MAX_TOKENS_PER_TURN,
+                    system=SYSTEM_PROMPT,
+                    tools=TOOLS,
+                    messages=messages,
+                    thinking=thinking_cfg,
+                )
+                break
+            except anthropic.RateLimitError:
+                if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
+                    await on_message(
+                        "⚠️ Anthropic's concurrent-connection rate limit "
+                        "is persistently exceeded — please wait a few "
+                        "minutes and start a new session."
+                    )
+                    return
+                await on_message(
+                    f"⏸ Hit Anthropic's concurrent-connection rate limit. "
+                    f"Waiting {RATE_LIMIT_PAUSE_SECONDS}s before retrying "
+                    f"(attempt {rl_attempt + 1}/{RATE_LIMIT_MAX_RETRIES})…"
+                )
+                await asyncio.sleep(RATE_LIMIT_PAUSE_SECONDS)
+        assert response is not None  # loop above either sets or returns
 
         # Forward any plain-text narration to the frontend (dedup repeats).
         text_combined = "".join(

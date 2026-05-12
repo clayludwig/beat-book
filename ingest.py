@@ -36,9 +36,15 @@ from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
+import anthropic
 import httpx
 
-from claude_client import CHAT_MODEL, chat_client
+from claude_client import (
+    CHAT_MODEL,
+    RATE_LIMIT_MAX_RETRIES,
+    RATE_LIMIT_PAUSE_SECONDS,
+    chat_client,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -688,24 +694,43 @@ def _normalize_chunk(
 
     tool_use_block = None
     for attempt in range(NORMALIZE_MAX_ATTEMPTS):
-        try:
-            # Extended thinking is incompatible with forced tool_choice, so
-            # we don't pass a `thinking` parameter here — the API treats
-            # omission as disabled, which is what we want for this call.
-            resp = client.messages.create(
-                model=NORMALIZE_MODEL,
-                max_tokens=NORMALIZE_MAX_TOKENS,
-                system=_NORMALIZE_SYSTEM,
-                messages=[
-                    {"role": "user", "content": user_prefix + text + user_suffix},
-                ],
-                tools=[_NORMALIZE_TOOL],
-                tool_choice={"type": "tool", "name": "register_stories"},
-            )
-        except Exception as e:
-            raise IngestError(
-                f"{source_label}: LLM normalization failed — {type(e).__name__}: {e}"
-            ) from e
+        # Inner retry loop catches RateLimitError (Anthropic concurrent-
+        # connection 429s) and logs every wait at WARNING so the operator
+        # can see what's happening instead of staring at a silent spinner.
+        resp = None
+        for rl_attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+            try:
+                # Extended thinking is incompatible with forced tool_choice,
+                # so we don't pass `thinking` here — omission == disabled.
+                resp = client.messages.create(
+                    model=NORMALIZE_MODEL,
+                    max_tokens=NORMALIZE_MAX_TOKENS,
+                    system=_NORMALIZE_SYSTEM,
+                    messages=[
+                        {"role": "user", "content": user_prefix + text + user_suffix},
+                    ],
+                    tools=[_NORMALIZE_TOOL],
+                    tool_choice={"type": "tool", "name": "register_stories"},
+                )
+                break
+            except anthropic.RateLimitError as e:
+                if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
+                    raise IngestError(
+                        f"{source_label}: rate limit not cleared after "
+                        f"{RATE_LIMIT_MAX_RETRIES} retries — {e}"
+                    ) from e
+                logger.warning(
+                    "Rate limited on %s; waiting %ds before retry %d/%d.",
+                    source_label, RATE_LIMIT_PAUSE_SECONDS,
+                    rl_attempt + 1, RATE_LIMIT_MAX_RETRIES,
+                )
+                time.sleep(RATE_LIMIT_PAUSE_SECONDS)
+            except Exception as e:
+                raise IngestError(
+                    f"{source_label}: LLM normalization failed — {type(e).__name__}: {e}"
+                ) from e
+
+        assert resp is not None  # loop above either sets resp or raises
 
         tool_use_block = next(
             (b for b in resp.content if getattr(b, "type", None) == "tool_use"),

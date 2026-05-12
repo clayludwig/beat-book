@@ -21,12 +21,16 @@ CHAT_MODEL = "claude-sonnet-4-6"
 # while leaving headroom for long tool-use turns.
 CHAT_TIMEOUT_SECONDS = 180.0
 
-# Let the SDK back off on 429s using the server's retry-after header.
-# Anthropic's concurrent-connections limits are per-tier and easy to hit
-# on multi-chunk ingests, especially when phantom requests from a killed
-# server are still consuming connection slots. Eight retries absorbs
-# cooldowns up to ~2–3 minutes before surfacing the failure.
-CHAT_MAX_RETRIES = 8
+# SDK retries are off so each 429 surfaces immediately at the call site
+# instead of disappearing into several silent minutes of internal backoff.
+# Call sites do their own retry using the constants below, logging every
+# wait so the operator (or the user, via on_message) sees what's happening.
+CHAT_MAX_RETRIES = 0
+
+# Explicit retry policy used by call sites when they catch RateLimitError.
+# 16 attempts × 60s ≈ 16 minutes of patient waiting before giving up.
+RATE_LIMIT_MAX_RETRIES = 16
+RATE_LIMIT_PAUSE_SECONDS = 60
 
 
 def chat_client(api_key: str | None = None) -> Anthropic:
