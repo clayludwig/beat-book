@@ -6,12 +6,12 @@ The ingest stage takes whatever a reporter uploads — files in any common forma
 
 **Stage 1** turns bytes into clean text. A format dispatcher routes each input to a converter — `markitdown` for office formats and PDFs, a custom JSON renderer for structured records, stdlib UTF-8 decoding for plain text, and an SSRF-protected HTTPS fetcher for URLs (which then dispatches the response body back through the same dispatcher). The output of stage 1 is always plain text or Markdown.
 
-**Stage 2** turns clean text into structured stories. A single LLM call with a strict tool-use schema reads the document and emits a list of stories, each described by metadata fields (title, date, author, link) and two short verbatim snippets that mark where the body begins and ends. The server then slices the body out of the original text using those markers. The LLM never rewrites story content; it only points at it.
+**Stage 2** turns clean text into structured stories. The LLM reads the document under a strict tool-use schema and emits a list of stories, each described by metadata fields (title, date, author, link) and two short verbatim snippets that mark where the body begins and ends. The server then slices the body out of the original text using those markers. The LLM never rewrites story content; it only points at it. Documents short enough to fit in one window go through a single LLM call; larger documents are split into overlapping windows and processed concurrently, with the results deduplicated on merge.
 
 ```
-bytes ──► extract_text ──► clean text ──► normalize (LLM) ──► Story list
-                                                  │
-                                                  └── markers ──► server slices verbatim body
+bytes ──► extract_text ──► clean text ──► normalize (LLM, possibly chunked) ──► Story list
+                                                       │
+                                                       └── markers ──► server slices verbatim body
 ```
 
 The rest of this doc walks through each stage and the design choices that fall out of "we want this to work for anything a reporter might upload."
@@ -185,15 +185,43 @@ A reporter uploading a folder will inevitably include some files that aren't new
 
 Both layers feed the same preview-UI behavior: the source appears in an "excluded" section with a short explanation, and is not included in the topic-discovery pipeline downstream.
 
-## The 120k-character truncation
+## Chunked normalization for long documents
 
-`MAX_NORMALIZE_CHARS = 120_000` caps the slice of the document the LLM actually sees. A 120k-character window is ~30k tokens at typical English density — comfortably within the model's input budget while leaving room for the system prompt, the schema, and the response.
+Documents that fit in a single LLM window (`WINDOW_SIZE = 100_000` chars, roughly 25k tokens) take the simple path: one call, one response, the marker resolver runs against the full text, done. That covers almost every individual news article and most multi-story Word docs.
 
-If a document exceeds this, the truncation is noted in the user-prefix sent to the model:
+Documents longer than that — a 500-page PDF compendium of a year's coverage, a CMS export rendered to plain text, an `.epub` of an annual report — used to hit a hard truncation. Now they're split into overlapping windows and processed concurrently.
 
-> Note: the document was truncated to 120000 characters for parsing. Identify stories within this window only.
+```
+text length:  ────────────────────────────────────────────────►
+              [────── chunk 1 ──────]
+                            [────── chunk 2 ──────]
+                                          [────── chunk 3 ──────]
+                                ↑                ↑
+                            15k overlap     15k overlap
+```
 
-This is a deliberate trade-off. A 500-page PDF compendium of a year's coverage will not have every story extracted from a single call — but that's the right cost to pay for a single-pass design. Multi-pass extraction over a windowed document would add latency, complexity, and a join step that the LLM would have to be trained on. In practice, single uploads are rarely that long; a reporter handing the system a 500-page archive can chunk it themselves, and the system happily processes each chunk as a separate source.
+**Window parameters.** `WINDOW_SIZE = 100_000`, `WINDOW_OVERLAP = 15_000`, effective step size 85k. A 144k-char document → 2 windows; a 1MB document → 12 windows.
+
+**Why overlap.** A story whose body straddles a chunk boundary needs to live in at least one chunk in its entirety, or the marker-based body extraction will fail for that story. 15k characters is roughly 3–5 typical news articles — large enough that any single story is fully contained in at least one adjacent window, small enough that the redundant LLM work is a manageable cost.
+
+**Concurrent dispatch.** Chunks fan out into a `ThreadPoolExecutor` with `NORMALIZE_CONCURRENCY = 4` in-flight calls. A 1MB document with 12 chunks finishes in about three sequential calls' worth of wall-clock time instead of twelve. Concurrency is capped because every additional in-flight call increases the risk of hitting the upstream provider's rate limit.
+
+**Failure isolation.** Each chunk's LLM call is wrapped in its own try/except. A single transient failure (network blip, model timeout, malformed tool response) is logged and the chunk is skipped. The merge proceeds with whatever succeeded. Only if every chunk fails does `normalize()` raise — and the partial-failure case surfaces in the `skip_reason` so the preview UI can show "3 of 12 chunks failed; partial results."
+
+**Deduplication on merge.** When two adjacent chunks overlap by 15k characters, a story whose body lies fully inside that overlap region is detected by both LLM calls. The merger keys each story on `(normalized title, first 200 chars of body)` and keeps the copy with the longer body — that's the one whose containing chunk had enough room for the full article rather than clipping at the window edge.
+
+```python
+def _dedup_key(story: Story) -> str:
+    title = re.sub(r"\s+", " ", story.title.lower().strip())
+    body_prefix = re.sub(r"\s+", " ", story.content[:200].lower().strip())
+    return f"{title}||{body_prefix}"
+```
+
+The title alone wasn't enough: two different city-council meetings can share the headline "Council meets, votes on budget." Adding 200 characters of body prefix gives the key enough specificity to distinguish them.
+
+**Safety cap.** `MAX_CHUNKS = 30` caps the per-document LLM-call count, which is roughly 2.5 million characters of text. Anything past that — a freakishly large upload — is dropped at chunk-formation time and surfaced as a `skip_reason` note. `MAX_FILE_BYTES = 15 MB` is the hard input ceiling regardless; the chunk cap is the soft limit on how much of a within-bounds file we'll spend tokens on.
+
+**`allow_full_doc_fallback` is mode-dependent.** The "exactly one story whose markers failed → use the whole document as the body" rescue path only fires when we know there's exactly one story TOTAL — not just one in this chunk. So the single-call path passes `allow_full_doc_fallback=True`, and the chunked path passes `False`. In chunked mode, a marker miss drops that story; no full-chunk fallback, because that would splice content from adjacent stories into one synthetic body.
 
 ## What this gets wrong
 
@@ -204,6 +232,8 @@ Honest failure modes:
 - **Stories where the title appears inside the body.** A self-referential intro ("This article will explain…") can fool the start-marker into landing on the title line rather than the actual first sentence. The system prompt is explicit about this ("Start with the first sentence of the article body itself, not the title or byline"), but the failure mode still happens occasionally.
 - **No structured-field validation.** Date inference can come back as `"sometime in 2026"` or `"April"` if the model gets confused. We trust the schema to enforce shape but not value — a malformed date passes through to the preview UI as-is, where the reporter can correct it.
 - **No fuzzy match across the corpus.** Each document is normalized independently; we don't check for duplicate stories across documents. A reporter uploading the same article twice (once as a docx, once as a URL) gets two copies in the pipeline.
+- **Stories longer than the chunk overlap can split.** If a single article's body exceeds `WINDOW_OVERLAP = 15_000` characters (roughly 2,500 words — long-form magazine territory), it can land fully inside neither adjacent chunk. The result is two partial detections that dedup-key won't match because the bodies start differently, leaving the reporter with two truncated copies of the same story. Raising `WINDOW_OVERLAP` (at the cost of more redundant LLM work) is the lever if this comes up in practice.
+- **Dedup key collisions.** Two genuinely different stories that share both a title and the first 200 characters of body (rare but possible — e.g., two duplicate-template press releases with different bodies past the boilerplate) get merged into one. The kept copy is whichever the merger saw first.
 
 The preview screen exists in part to let the reporter catch these. Title, date, author, and inclusion can all be edited inline before the confirmed list goes to `/process`.
 
@@ -213,8 +243,8 @@ A few choices fall out of the goal of "support any format":
 
 - **One pipeline, every format.** No privileged path. JSON gets a custom renderer because its structure is rich enough to leverage, but the LLM normalization step doesn't know or care whether its input came from JSON or a Word doc — it sees plain text in either case.
 - **Marker-based body extraction.** The reporter cites these stories. They have to trust that what the tool says the story says is what the story says. The LLM as pointer-not-paraphraser is the load-bearing decision.
-- **One LLM call per document.** Cost is proportional to input length, not story count. A document with twelve articles in it costs roughly the same as a document with one article and twelve paragraphs.
+- **Single LLM call when it fits, chunked when it doesn't.** Cost is proportional to input length, not story count. Most uploads fit in one window and pay one LLM call. Large documents pay more — but the per-chunk cost is bounded by `WINDOW_SIZE`, and the chunk count is bounded by `MAX_CHUNKS`, so cost is predictable and capped.
 - **Server-side body assembly, not LLM-side.** The LLM's tool call returns a JSON object; assembling that into the final story dicts happens in plain Python, where any error mode is debuggable and any business rule (the 20-character drop, the single-story fallback, the date normalization) lives in one place.
 - **Format dispatch is dumb on purpose.** The extension table in `extract_text` is a flat dispatch with no fallbacks-in-the-middle. If a file is `.docx`, markitdown handles it. If markitdown fails, we surface the failure rather than silently retrying as something else. Predictable failure beats clever recovery.
 
-That's the whole story-extraction stage: a format-agnostic dispatcher, a single LLM call that points rather than paraphrases, a marker resolver that survives small imperfections in the LLM's output, and a preview UI that gives the reporter the last word before anything downstream sees the result.
+That's the whole story-extraction stage: a format-agnostic dispatcher, an LLM that points rather than paraphrases, a marker resolver that survives small imperfections in the LLM's output, an overlapping-window scheme that scales to arbitrarily long inputs, and a preview UI that gives the reporter the last word before anything downstream sees the result.

@@ -9,10 +9,12 @@ Two stages:
    stdlib handles txt/md/json. Unknown extensions get a utf-8 best-effort.
 
 2. normalize(text, source_label, ollama_key) → list[Story]
-   Single Ollama Cloud (qwen3.5:397b-cloud) call with strict tool-use schema.
-   The LLM only infers metadata (title/date/author) and returns character
-   offsets for each story's body — the body itself is sliced from the
-   original text, never LLM-rewritten.
+   Ollama Cloud (qwen3.5:397b-cloud) tool-use call with a strict schema.
+   Documents that fit in one window get a single call; larger documents are
+   split into overlapping windows, processed concurrently, and deduplicated
+   on merge. The LLM only infers metadata (title/date/author) and returns
+   verbatim markers for each story's body — the body itself is sliced from
+   the original text, never LLM-rewritten.
 
 A wrapper, ingest_source(), runs both stages and packages the result for
 the /ingest route.
@@ -20,6 +22,7 @@ the /ingest route.
 
 from __future__ import annotations
 
+import concurrent.futures
 import html
 import io
 import ipaddress
@@ -44,11 +47,25 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 MAX_FILE_BYTES = 15 * 1024 * 1024            # 15 MB per file
-MAX_NORMALIZE_CHARS = 120_000                # cap before single-call normalization
 URL_FETCH_TIMEOUT = 15.0                     # seconds
 URL_USER_AGENT = "BeatBookBuilder/1.0 (+https://github.com/clayludwig/beat-book)"
 NORMALIZE_MODEL = CHAT_MODEL
-NORMALIZE_MAX_TOKENS = 4096
+# Max tokens per LLM call. Has to cover both internal thinking tokens (Qwen
+# burns a lot) and the actual tool-call response (marker data for up to ~30
+# stories per chunk).
+NORMALIZE_MAX_TOKENS = 32768
+# Number of attempts per chunk when the model returns no tool call. Qwen's
+# tool_choice compliance is not 100%; one retry recovers most cases.
+NORMALIZE_MAX_ATTEMPTS = 2
+
+# Chunked normalization: documents over WINDOW_SIZE get split into overlapping
+# windows and processed concurrently. WINDOW_OVERLAP must be larger than any
+# expected single-story body so a story spanning a boundary is fully contained
+# in one of the two adjacent windows.
+WINDOW_SIZE = 100_000           # primary chunk size in chars
+WINDOW_OVERLAP = 15_000          # chars of overlap between adjacent chunks
+MAX_CHUNKS = 30                  # safety cap on LLM calls per document
+NORMALIZE_CONCURRENCY = 4        # in-flight chunk calls per document
 
 # Extensions markitdown converts to readable markdown.
 _MARKITDOWN_EXTS = {
@@ -572,64 +589,98 @@ def _slice_body(text: str, body_starts_with: str, body_ends_with: str) -> str:
     return text[start:end].strip()
 
 
-def normalize(
+def _make_chunks(text: str) -> list[str]:
+    """Split text into overlapping windows of WINDOW_SIZE chars.
+
+    Adjacent windows share WINDOW_OVERLAP characters so a story whose body
+    straddles the cut between window N and window N+1 is fully contained in
+    at least one of them — provided the body is shorter than WINDOW_OVERLAP,
+    which is true for essentially all news articles.
+    """
+    if len(text) <= WINDOW_SIZE:
+        return [text]
+    chunks: list[str] = []
+    step = WINDOW_SIZE - WINDOW_OVERLAP
+    start = 0
+    while start < len(text):
+        end = min(start + WINDOW_SIZE, len(text))
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start += step
+    return chunks
+
+
+def _dedup_key(story: Story) -> str:
+    """Stable key for deduplicating stories that show up in two overlapping
+    chunks. Title + first 200 chars of body is specific enough to distinguish
+    different events that happen to share a headline."""
+    title = re.sub(r"\s+", " ", story.title.lower().strip())
+    body_prefix = re.sub(r"\s+", " ", story.content[:200].lower().strip())
+    return f"{title}||{body_prefix}"
+
+
+def _normalize_chunk(
     text: str,
     source_label: str,
     ollama_key: str,
     *,
     link_hint: str = "",
+    allow_full_doc_fallback: bool = True,
 ) -> Tuple[list[Story], bool, str]:
-    """Stage 2. Run extracted text through Ollama Cloud (qwen3.5:397b-cloud)
-    to produce structured stories.
+    """Single LLM call on a chunk of text (which may be the whole document).
 
-    Returns (stories, is_news_content, skip_reason).
+    allow_full_doc_fallback: when the LLM reports exactly one story but its
+    markers fail to resolve, fall back to using this chunk's full text as
+    that story's body. Safe only for whole-document calls; in chunked mode
+    it would splice in content from adjacent stories.
     """
-    if not text or not text.strip():
-        return [], False, "The document appears to be empty."
-
-    truncated = False
-    if len(text) > MAX_NORMALIZE_CHARS:
-        text = text[:MAX_NORMALIZE_CHARS]
-        truncated = True
-
     client = chat_client(ollama_key)
 
     user_prefix = f"Source label: {source_label}\n"
     if link_hint:
         user_prefix += f"Source URL: {link_hint}\n"
-    if truncated:
-        user_prefix += (
-            f"Note: the document was truncated to {MAX_NORMALIZE_CHARS} "
-            "characters for parsing. Identify stories within this window only.\n"
-        )
-    user_prefix += f"Document length (chars): {len(text)}\n\n"
+    user_prefix += f"Text length (chars): {len(text)}\n\n"
     user_prefix += "----- BEGIN DOCUMENT -----\n"
     user_suffix = "\n----- END DOCUMENT -----"
 
-    try:
-        resp = client.chat.completions.create(
-            model=NORMALIZE_MODEL,
-            max_tokens=NORMALIZE_MAX_TOKENS,
-            messages=[
-                {"role": "system", "content": _NORMALIZE_SYSTEM},
-                {"role": "user", "content": user_prefix + text + user_suffix},
-            ],
-            tools=[_NORMALIZE_TOOL],
-            tool_choice={"type": "function", "function": {"name": "register_stories"}},
-        )
-    except Exception as e:
-        raise IngestError(
-            f"{source_label}: LLM normalization failed — {type(e).__name__}: {e}"
-        ) from e
+    tool_call = None
+    for attempt in range(NORMALIZE_MAX_ATTEMPTS):
+        try:
+            resp = client.chat.completions.create(
+                model=NORMALIZE_MODEL,
+                max_tokens=NORMALIZE_MAX_TOKENS,
+                messages=[
+                    {"role": "system", "content": _NORMALIZE_SYSTEM},
+                    {"role": "user", "content": user_prefix + text + user_suffix},
+                ],
+                tools=[_NORMALIZE_TOOL],
+                tool_choice={"type": "function", "function": {"name": "register_stories"}},
+            )
+        except Exception as e:
+            raise IngestError(
+                f"{source_label}: LLM normalization failed — {type(e).__name__}: {e}"
+            ) from e
 
-    msg = resp.choices[0].message
-    tool_calls = msg.tool_calls or []
-    tool_call = next(
-        (tc for tc in tool_calls if tc.function and tc.function.name == "register_stories"),
-        None,
-    )
+        msg = resp.choices[0].message
+        tool_calls = msg.tool_calls or []
+        tool_call = next(
+            (tc for tc in tool_calls if tc.function and tc.function.name == "register_stories"),
+            None,
+        )
+        if tool_call is not None:
+            break
+        if attempt + 1 < NORMALIZE_MAX_ATTEMPTS:
+            logger.warning(
+                "Chunk for %s returned no tool call on attempt %d/%d; retrying.",
+                source_label, attempt + 1, NORMALIZE_MAX_ATTEMPTS,
+            )
+
     if tool_call is None:
-        raise IngestError(f"{source_label}: LLM did not return structured stories.")
+        raise IngestError(
+            f"{source_label}: LLM did not return structured stories after "
+            f"{NORMALIZE_MAX_ATTEMPTS} attempts."
+        )
 
     try:
         payload = json.loads(tool_call.function.arguments or "{}")
@@ -637,6 +688,7 @@ def normalize(
         raise IngestError(
             f"{source_label}: LLM returned invalid tool-call JSON — {e}"
         ) from e
+
     is_news = bool(payload.get("is_news_content", False))
     skip_reason = (payload.get("skip_reason") or "").strip()
     raw_stories = payload.get("stories") or []
@@ -645,18 +697,14 @@ def normalize(
         return [], False, skip_reason or "No news stories found in this document."
 
     stories: list[Story] = []
-    single_story_total = len(raw_stories) == 1
+    use_full_doc_fallback = allow_full_doc_fallback and len(raw_stories) == 1
     for raw in raw_stories:
         body_start = raw.get("body_starts_with") or ""
         body_end = raw.get("body_ends_with") or ""
 
         content = _slice_body(text, body_start, body_end)
 
-        # Only fall back to the full document when marker lookup totally
-        # failed AND there is only one story in this document — for
-        # multi-story files, full-doc fallback would duplicate content
-        # across stories.
-        if len(content) < 20 and single_story_total:
+        if len(content) < 20 and use_full_doc_fallback:
             logger.warning(
                 "Marker lookup for %s failed (got %d chars); falling back to full text.",
                 source_label, len(content),
@@ -683,11 +731,113 @@ def normalize(
         ))
 
     if not stories:
-        # All stories were dropped — treat the whole document as non-news so
-        # the user gets a clear reason in the preview.
         return [], False, skip_reason or "No story bodies could be extracted from this document."
 
     return stories, True, skip_reason
+
+
+def normalize(
+    text: str,
+    source_label: str,
+    ollama_key: str,
+    *,
+    link_hint: str = "",
+) -> Tuple[list[Story], bool, str]:
+    """Stage 2. Run extracted text through Ollama Cloud to produce structured
+    stories. Single LLM call for documents that fit in one window; for larger
+    documents, fan out into overlapping windows processed concurrently and
+    deduplicate on merge.
+
+    Returns (stories, is_news_content, skip_reason).
+    """
+    if not text or not text.strip():
+        return [], False, "The document appears to be empty."
+
+    if len(text) <= WINDOW_SIZE:
+        return _normalize_chunk(
+            text, source_label, ollama_key,
+            link_hint=link_hint,
+            allow_full_doc_fallback=True,
+        )
+
+    chunks = _make_chunks(text)
+    truncated = len(chunks) > MAX_CHUNKS
+    if truncated:
+        chunks = chunks[:MAX_CHUNKS]
+
+    logger.info(
+        "Chunked normalization for %s: %d chunks (text=%d chars, window=%d, overlap=%d)",
+        source_label, len(chunks), len(text), WINDOW_SIZE, WINDOW_OVERLAP,
+    )
+
+    # Run chunks concurrently. Failed chunks are logged and skipped; we only
+    # raise if every chunk fails.
+    results: list[Optional[Tuple[list[Story], bool, str]]] = [None] * len(chunks)
+
+    def _process(idx: int) -> Optional[Tuple[list[Story], bool, str]]:
+        try:
+            return _normalize_chunk(
+                chunks[idx], source_label, ollama_key,
+                link_hint=link_hint,
+                allow_full_doc_fallback=False,
+            )
+        except IngestError as e:
+            logger.warning(
+                "Chunk %d/%d failed for %s: %s",
+                idx + 1, len(chunks), source_label, e,
+            )
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=NORMALIZE_CONCURRENCY) as ex:
+        futures = {ex.submit(_process, i): i for i in range(len(chunks))}
+        for fut in concurrent.futures.as_completed(futures):
+            results[futures[fut]] = fut.result()
+
+    failed = sum(1 for r in results if r is None)
+    if failed == len(chunks):
+        raise IngestError(
+            f"{source_label}: all {len(chunks)} chunks failed during normalization."
+        )
+
+    # Merge: deduplicate by (title, body prefix). When the same story shows up
+    # in two overlapping chunks, keep the one with the longer body — that's
+    # the copy where the chunk window contained the full article rather than
+    # clipping at the edge.
+    merged: dict[str, Story] = {}
+    skip_reasons: list[str] = []
+
+    for result in results:
+        if result is None:
+            continue
+        chunk_stories, _, chunk_skip = result
+        if chunk_skip and not chunk_stories:
+            skip_reasons.append(chunk_skip)
+        for story in chunk_stories:
+            key = _dedup_key(story)
+            existing = merged.get(key)
+            if existing is None or len(story.content) > len(existing.content):
+                merged[key] = story
+
+    stories = list(merged.values())
+
+    if not stories:
+        return [], False, (
+            skip_reasons[0] if skip_reasons
+            else "No news stories found in this document."
+        )
+
+    note_parts: list[str] = []
+    if failed:
+        note_parts.append(
+            f"{failed} of {len(chunks)} chunks failed; partial results."
+        )
+    if truncated:
+        note_parts.append(
+            f"Document is very large; processed only the first {MAX_CHUNKS} chunks "
+            f"(~{MAX_CHUNKS * (WINDOW_SIZE - WINDOW_OVERLAP) // 1000}k chars)."
+        )
+
+    return stories, True, " ".join(note_parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -709,7 +859,9 @@ def ingest_file(filename: str, raw: bytes, ollama_key: str) -> IngestedSource:
         return source
 
     source.char_count = len(text)
-    source.truncated = len(text) > MAX_NORMALIZE_CHARS
+    # Chunked normalization processes the whole text up to MAX_CHUNKS windows;
+    # anything beyond that is dropped at merge time.
+    source.truncated = len(text) > MAX_CHUNKS * (WINDOW_SIZE - WINDOW_OVERLAP)
 
     if not text.strip():
         source.excluded = True
@@ -752,7 +904,9 @@ def ingest_url(url: str, ollama_key: str) -> IngestedSource:
         return source
 
     source.char_count = len(text)
-    source.truncated = len(text) > MAX_NORMALIZE_CHARS
+    # Chunked normalization processes the whole text up to MAX_CHUNKS windows;
+    # anything beyond that is dropped at merge time.
+    source.truncated = len(text) > MAX_CHUNKS * (WINDOW_SIZE - WINDOW_OVERLAP)
 
     if not text.strip():
         source.excluded = True
