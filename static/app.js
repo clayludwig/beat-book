@@ -23,6 +23,12 @@
   const previewProgressStep   = document.getElementById("preview-progress-step");
   const previewProgressBar    = document.getElementById("preview-progress-bar");
   const previewProgressDetail = document.getElementById("preview-progress-detail");
+  const filterChips     = document.querySelectorAll(".confidence-filter");
+  const filterCountEls  = {
+    high:   document.getElementById("filter-count-high"),
+    medium: document.getElementById("filter-count-medium"),
+    low:    document.getElementById("filter-count-low"),
+  };
 
   const interviewFormHost = document.getElementById("interview-form-host");
 
@@ -48,6 +54,10 @@
   let ws = null;
   let activeInterview = null;
   const stats = { storiesRead: 0, searches: 0, topicsListed: 0 };
+  // Visibility filter for the preview screen. Toggling a level off hides
+  // those rows but does NOT change their `included` state — that stays
+  // under user control via the per-row checkbox.
+  const confidenceFilter = { high: true, medium: true, low: true };
 
   let elapsedTimer = null;
   let elapsedStart = null;
@@ -243,11 +253,14 @@
     });
 
     refreshIncludedCount();
+    updateConfidenceCounts();
+    applyConfidenceFilter();
   }
 
   function buildStoryRow(srcIdx, storyIdx, story) {
     const row = document.createElement("div");
     row.className = "preview-story";
+    row.dataset.confidence = (story.confidence || "medium").toLowerCase();
     if (!story.included) row.classList.add("excluded");
 
     // Row 1: include checkbox + editable fields
@@ -323,6 +336,44 @@
       : `${total} ${total === 1 ? "story" : "stories"} selected`;
     previewRunBtn.disabled = total === 0;
   }
+
+  function updateConfidenceCounts() {
+    const counts = { high: 0, medium: 0, low: 0 };
+    for (const src of previewState) {
+      if (src.excluded) continue;
+      for (const s of src.stories) {
+        const level = (s.confidence || "medium").toLowerCase();
+        if (level in counts) counts[level]++;
+      }
+    }
+    for (const level of Object.keys(counts)) {
+      if (filterCountEls[level]) filterCountEls[level].textContent = counts[level];
+    }
+  }
+
+  function applyConfidenceFilter() {
+    // Hide individual story rows whose confidence is filtered out.
+    document.querySelectorAll(".preview-story").forEach(row => {
+      const level = row.dataset.confidence || "medium";
+      row.classList.toggle("filtered-out", !confidenceFilter[level]);
+    });
+    // Hide source cards whose stories are all filtered out, so the screen
+    // doesn't end up with a sea of empty source headers.
+    document.querySelectorAll(".preview-source").forEach(card => {
+      const anyVisible = !!card.querySelector(".preview-story:not(.filtered-out)");
+      card.classList.toggle("filtered-out", !anyVisible);
+    });
+  }
+
+  filterChips.forEach(chip => {
+    chip.addEventListener("click", () => {
+      const level = chip.dataset.level;
+      confidenceFilter[level] = !confidenceFilter[level];
+      chip.classList.toggle("active", confidenceFilter[level]);
+      chip.setAttribute("aria-pressed", String(confidenceFilter[level]));
+      applyConfidenceFilter();
+    });
+  });
 
   previewBackBtn.addEventListener("click", () => {
     switchScreen("upload");

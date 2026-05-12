@@ -59,6 +59,36 @@
         <h2>Beat Book Builder</h2>
         <div id="preview-session-info" class="session-info"></div>
       </header>
+      <div class="preview-toolbar">
+        <div class="preview-toolbar-row">
+          <button id="preview-back-btn" class="btn">Back to upload</button>
+          <div class="preview-filters" id="preview-filters" role="group" aria-label="Filter by confidence">
+            <button type="button" class="confidence-filter high active" data-level="high" aria-pressed="true">
+              <span class="filter-label">High</span>
+              <span class="filter-count" id="filter-count-high">0</span>
+            </button>
+            <button type="button" class="confidence-filter medium active" data-level="medium" aria-pressed="true">
+              <span class="filter-label">Medium</span>
+              <span class="filter-count" id="filter-count-medium">0</span>
+            </button>
+            <button type="button" class="confidence-filter low active" data-level="low" aria-pressed="true">
+              <span class="filter-label">Low</span>
+              <span class="filter-count" id="filter-count-low">0</span>
+            </button>
+          </div>
+          <div class="preview-toolbar-right">
+            <span id="preview-included-count" class="submit-hint"></span>
+            <button id="preview-run-btn" class="btn primary">Run pipeline</button>
+          </div>
+        </div>
+        <div id="preview-status" class="preview-toolbar-progress" hidden>
+          <div class="progress-step" id="preview-progress-step">Preparing…</div>
+          <div class="progress-bar-track">
+            <div class="progress-bar-fill" id="preview-progress-bar"></div>
+          </div>
+          <div class="progress-detail" id="preview-progress-detail"></div>
+        </div>
+      </div>
       <div class="screen-body">
         <div class="screen-content">
           <div class="interview-heading">
@@ -69,22 +99,6 @@
 
           <div id="preview-excluded" class="preview-excluded-list" hidden></div>
           <div id="preview-sources" class="preview-sources"></div>
-
-          <div id="preview-status" class="status" hidden>
-            <div class="progress-container">
-              <div class="progress-step" id="preview-progress-step">Preparing…</div>
-              <div class="progress-bar-track">
-                <div class="progress-bar-fill" id="preview-progress-bar"></div>
-              </div>
-              <div class="progress-detail" id="preview-progress-detail"></div>
-            </div>
-          </div>
-
-          <div class="submit-row preview-actions">
-            <button id="preview-back-btn" class="btn">Back to upload</button>
-            <span id="preview-included-count" class="submit-hint"></span>
-            <button id="preview-run-btn" class="btn primary">Run pipeline</button>
-          </div>
         </div>
       </div>
     </div>
