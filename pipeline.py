@@ -11,11 +11,14 @@ import concurrent.futures
 import hashlib
 import pickle
 import re
+import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Callable
-from tqdm import tqdm
+
+import anthropic
 import numpy as np
+from tqdm import tqdm
 
 # Type for progress callbacks: (step_name, progress_fraction 0.0–1.0, detail_text)
 ProgressCallback = Callable[[str, float, str], None]
@@ -24,7 +27,12 @@ from openai import OpenAI
 import umap
 import hdbscan
 
-from claude_client import CHAT_MODEL, chat_client
+from claude_client import (
+    CHAT_MODEL,
+    RATE_LIMIT_MAX_RETRIES,
+    RATE_LIMIT_PAUSE_SECONDS,
+    chat_client,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -89,6 +97,26 @@ class PipelineResult:
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _messages_create_with_retry(client, *, _label: str = "", **kwargs):
+    """client.messages.create with RateLimitError retry, matching the policy
+    used by ingest.py and agent.py. Anthropic's concurrent-connection cap
+    is the dominant failure mode in the parallel labeling / briefings
+    phase; without this wrapper one transient 429 kills a whole topic's
+    briefing or label."""
+    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            return client.messages.create(**kwargs)
+        except anthropic.RateLimitError:
+            if attempt >= RATE_LIMIT_MAX_RETRIES:
+                raise
+            tag = f"[{_label}] " if _label else ""
+            print(
+                f"{tag}rate-limited; waiting {RATE_LIMIT_PAUSE_SECONDS}s "
+                f"(retry {attempt + 1}/{RATE_LIMIT_MAX_RETRIES})...",
+                flush=True,
+            )
+            time.sleep(RATE_LIMIT_PAUSE_SECONDS)
 
 # ─── Quote stripping ────────────────────────────────────────────────────────
 #
@@ -368,7 +396,9 @@ def _label_cluster(client, stories: List[dict], indices: List[int], reduced: np.
         + "\n".join(snippets)
         + "\n\nReturn one entry with cluster_id=0."
     )
-    resp = client.messages.create(
+    resp = _messages_create_with_retry(
+        client,
+        _label="label-cluster",
         model=LABEL_MODEL,
         max_tokens=512,
         messages=[{"role": "user", "content": prompt}],
@@ -421,7 +451,9 @@ def _label_all(client, stories, labels, reduced, level_name, on_progress=None):
     # Output budget: ~50 tokens per entry (cluster_id + label + JSON framing).
     # 64 * N with a 1024 floor covers ~80+ clusters comfortably; any cluster
     # the model skips falls through to the per-cluster repair path below.
-    resp = client.messages.create(
+    resp = _messages_create_with_retry(
+        client,
+        _label=f"label-{level_name}-batch",
         model=LABEL_MODEL,
         max_tokens=max(1024, 64 * len(unique)),
         messages=[{"role": "user", "content": prompt}],
@@ -478,7 +510,7 @@ def _label_all(client, stories, labels, reduced, level_name, on_progress=None):
 BRIEFING_DETAILED_STORIES = 20   # full first-N-words for the top stories
 BRIEFING_DETAIL_WORDS = 450      # words of body for each detailed story
 BRIEFING_TITLE_TAIL_CAP = 80     # additional title/date-only entries listed
-BRIEFING_CONCURRENCY = 6         # parallel topics
+BRIEFING_CONCURRENCY = 4         # parallel topics — tuned to stay under Anthropic's concurrent-connection cap on common tiers
 BRIEFING_MAX_TOKENS = 3072       # generous output cap per topic
 
 
@@ -629,7 +661,9 @@ def _briefing_for_topic(client, stories, topic_label, indices, reduced):
         return empty
 
     prompt = _topic_briefing_prompt(topic_label, stories, indices, reduced)
-    resp = client.messages.create(
+    resp = _messages_create_with_retry(
+        client,
+        _label=f"briefings/{topic_label}",
         model=CHAT_MODEL,
         max_tokens=BRIEFING_MAX_TOKENS,
         messages=[{"role": "user", "content": prompt}],

@@ -31,6 +31,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+import anthropic
 from anthropic import Anthropic
 
 from claude_client import thinking_enabled
@@ -41,7 +42,11 @@ from claude_client import thinking_enabled
 
 MODEL = "claude-opus-4-7"
 MAX_TOKENS_PER_TURN = 32000
-MAX_TURNS = 30
+# Lowered from 30 → 15: a typical successful research pass finishes in
+# 8–12 turns (view, plan, ~3 search rounds, scraper, ~3 edits, finalize),
+# and a tighter cap reduces total Opus cost + exposure to transient 5xx
+# errors mid-run. The model is pushed to finalize sooner.
+MAX_TURNS = 15
 BASH_TIMEOUT_SECONDS = 60
 WEB_SEARCH_MAX_USES = 20
 WEB_FETCH_MAX_USES = 20
@@ -676,10 +681,44 @@ async def run_research_agent(
                             streamed_container_id = c.id
                 return stream.get_final_message(), streamed_container_id
 
-        try:
-            response, streamed_cid = await asyncio.to_thread(_stream_once)
-        except Exception as e:
-            raise RuntimeError(f"Opus 4.7 request failed on turn {turn + 1}: {e}") from e
+        # Retry transient Anthropic-side failures (5xx, rate limits, network
+        # blips, timeouts) before giving up on the turn. Opus 4.7 streaming
+        # calls are long and occasionally see a single bad response that
+        # disappears on a retry; without this, one 500 ends the whole
+        # research stage and the user falls back to the un-revised draft.
+        response = None
+        streamed_cid = None
+        last_err: Optional[Exception] = None
+        TRANSIENT_RETRIES = 3
+        TRANSIENT_PAUSE = 10
+        for rl_attempt in range(TRANSIENT_RETRIES + 1):
+            try:
+                response, streamed_cid = await asyncio.to_thread(_stream_once)
+                last_err = None
+                break
+            except (
+                anthropic.APIStatusError,
+                anthropic.RateLimitError,
+                anthropic.APIConnectionError,
+                anthropic.APITimeoutError,
+            ) as e:
+                last_err = e
+                if rl_attempt >= TRANSIENT_RETRIES:
+                    break
+                print(
+                    f"[research_agent] turn={turn + 1} transient {type(e).__name__}; "
+                    f"waiting {TRANSIENT_PAUSE}s and retrying "
+                    f"({rl_attempt + 1}/{TRANSIENT_RETRIES})",
+                    flush=True,
+                )
+                await asyncio.sleep(TRANSIENT_PAUSE)
+            except Exception as e:
+                last_err = e
+                break
+        if last_err is not None:
+            raise RuntimeError(
+                f"Opus 4.7 request failed on turn {turn + 1}: {last_err}"
+            ) from last_err
 
         if streamed_cid is not None:
             container_id = streamed_cid
