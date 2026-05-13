@@ -287,10 +287,11 @@ def _extract_json(raw: bytes) -> str:
         # Not valid JSON — return raw text; the LLM can still try.
         return text
 
+    # In _extract_json, after rendering each item:
     if isinstance(data, list):
         rendered = [r for r in (_render_value(item) for item in data) if r]
-        return "\n\n---\n\n".join(rendered)
-    return _render_value(data)
+        rendered = [r[:1500] for r in rendered]  # cap per-item length
+    return "\n\n---\n\n".join(rendered)
 
 
 def extract_text(filename: str, raw: bytes) -> str:

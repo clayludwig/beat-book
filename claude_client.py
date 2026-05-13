@@ -19,7 +19,7 @@ CHAT_MODEL = "claude-sonnet-4-6"
 # Per-request timeout for the Anthropic client. The SDK default is 10
 # minutes; 180s keeps real failures visible to the user inside ~3 minutes
 # while leaving headroom for long tool-use turns.
-CHAT_TIMEOUT_SECONDS = 180.0
+CHAT_TIMEOUT_SECONDS = 600.0
 
 # SDK retries are off so each 429 surfaces immediately at the call site
 # instead of disappearing into several silent minutes of internal backoff.

@@ -593,7 +593,7 @@ async def run_research_agent(
     if not markdown_path.is_file():
         raise FileNotFoundError(f"Markdown file not found in sandbox: {markdown_path}")
 
-    client = Anthropic(api_key=anthropic_api_key)
+    client = Anthropic(api_key=anthropic_api_key, timeout=600.0)
 
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         markdown_filename=markdown_filename,
