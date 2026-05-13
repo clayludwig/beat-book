@@ -10,7 +10,7 @@ sandbox directory, does its own research on the open internet, and rewrites the
 file in place with additional contextual material a reporter would find
 useful (history, key figures, related policy, adjacent coverage, recent news).
 
-Model: Claude Opus 4.7 with adaptive thinking + high effort.
+Model: Claude Sonnet 4.6 (no extended thinking; tuned for tool-loop speed).
 
 Tools given to the model:
   - bash_20250124            (client-executed, CWD pinned to sandbox)
@@ -31,21 +31,25 @@ import subprocess
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+import anthropic
 from anthropic import Anthropic
-
-from claude_client import thinking_enabled
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-MODEL = "claude-opus-4-7"
-MAX_TOKENS_PER_TURN = 32000
-MAX_TURNS = 30
+MODEL = "claude-sonnet-4-6"
+MAX_TOKENS_PER_TURN = 4000
+MAX_TURNS = 6
 BASH_TIMEOUT_SECONDS = 60
-WEB_SEARCH_MAX_USES = 20
-WEB_FETCH_MAX_USES = 20
-WEB_FETCH_MAX_CONTENT_TOKENS = 50_000
+WEB_SEARCH_MAX_USES = 5
+WEB_FETCH_MAX_USES = 5
+WEB_FETCH_MAX_CONTENT_TOKENS = 15_000
+
+# Retry shield around each streaming call: handles rate limits, 5xx, network
+# drops, and SDK timeouts. Non-transient errors propagate immediately.
+TRANSIENT_RETRIES = 3
+TRANSIENT_PAUSE_SECONDS = 10
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOL DEFINITIONS
@@ -54,7 +58,7 @@ WEB_FETCH_MAX_CONTENT_TOKENS = 50_000
 FINALIZE_TOOL_NAME = "finalize_beat_book"
 
 def build_tools() -> List[Dict[str, Any]]:
-    """Tool list passed to the Opus 4.7 API.
+    """Tool list passed to the research-agent API call.
 
     Do NOT add a standalone code_execution tool — the `_20260209` web tools
     run their dynamic filtering inside a managed code-execution sandbox on
@@ -285,36 +289,41 @@ promising pages in depth. Web fetch can only retrieve URLs that have \
 already appeared in the conversation (including from prior search results), \
 so you must search before fetching an unfamiliar URL.
 
-# Build at least one scraper
+# Build a scraper
 
-Before you finalize, you MUST write and run at least one small Python \
-scraper that pulls structured data from a live web page relevant to this \
-beat. This is non-negotiable — shell `curl` or `web_fetch` alone do not \
-count. The scraper should:
+Before you finalize, you SHOULD write and run one small Python scraper \
+that pulls structured data from a live web page relevant to this beat. \
+The reporter values having a reusable scraper artifact, so this is your \
+standard output — skip it only if the beat genuinely has no scrapable \
+target. Good targets:
+
+- Upcoming meetings / hearings calendar
+- Roster of officials, board members, or staff
+- Court docket listing or case search results
+- Budget line items, lobbyist registrations, or contract awards
+- A JSON API response from a Socrata portal (Chicago / Cook County / \
+  Illinois portals in `<suggested_sources>` are excellent here — many \
+  return clean JSON from a plain `requests.get` with no HTML parsing)
+- An RSS/Atom feed or press-release archive
+
+The scraper should:
 
 - Live in the sandbox as a `.py` file you create (e.g. `scrape_meetings.py`).
 - Use the standard library (`urllib.request`, `html.parser`, `json`, `re`, \
   `csv`) or any of `requests`, `beautifulsoup4` (import `bs4`), or `lxml` \
   — all three are installed.
-- Target something the reporter would actually want in structured form: \
-  an upcoming meetings / hearings calendar, a roster of officials, a \
-  court docket listing, press-release archive, budget line items, an \
-  RSS/Atom feed, a JSON API response, etc. Many of the portals listed \
-  in the `<suggested_sources>` block (below) are good candidates when \
-  the beat falls in their geographic scope.
-- Write its parsed output to a file in the sandbox (JSON or Markdown \
-  works well) and print a short summary to stdout.
-- Be polite: a reasonable `User-Agent` header, no tight loops, respect \
-  obvious `robots.txt` hints. One page fetch is enough to count.
+- Write its parsed output to a sandbox file (JSON or Markdown) and print \
+  a short summary to stdout.
+- Be polite: a reasonable `User-Agent` header, no tight loops.
 
 Run the scraper with `python3 scraper_name.py`, inspect the output, then \
 fold the most useful rows into the beat book (e.g. a "Calendar" or "Key \
-People" section). Keep the scraper file in the sandbox — the reporter may \
-reuse it.
+People" section). Keep the scraper file in the sandbox — the reporter \
+will reuse it.
 
-If your first target 4xx / 5xxs or returns unexpected HTML, try a \
-different source rather than scraping something useless; one working \
-scraper beats three broken ones.
+Time budget: if your first target 4xx / 5xxs or returns unexpected HTML, \
+switch to a different source rather than burning turns debugging. One \
+working scraper beats three broken ones.
 
 # How to revise the file
 
@@ -358,18 +367,23 @@ Use it to calibrate tone, depth, and focus:
 
 # Workflow
 
-1. View the Markdown file.
-2. Plan 3–6 research threads based on the beat, the reporter's answers, and \
-   the file's current gaps.
-3. Search + fetch authoritative sources. Prefer primary sources, major \
-   newspapers, and government/NGO publications. The `<suggested_sources>` \
-   block has vetted starting points when the beat overlaps Chicago, Cook \
-   County, Illinois, or the listed federal sources.
-4. Write and run at least one Python scraper (see "Build at least one \
-   scraper" above) and fold its output into the beat book.
-5. Edit the file incrementally with the text editor's `str_replace` and \
-   `insert` commands. Use `bash` for larger operations (e.g. `cat` to \
-   re-read, `wc -w` to track length).
+You have at most ~6 turns total — be efficient and prefer batching tool \
+calls within a single turn over spreading them across many turns.
+
+1. View the Markdown file (you can plan your research threads in the same \
+   turn).
+2. Pick 3–4 high-value research threads based on the beat, the reporter's \
+   answers, and the file's gaps.
+3. Search + fetch authoritative sources, batching multiple `web_search` / \
+   `web_fetch` tool calls in the same turn when threads are independent. \
+   Prefer primary sources, major newspapers, and government/NGO \
+   publications. Lean on the `<suggested_sources>` block when the beat \
+   overlaps Chicago, Cook County, Illinois, or the listed federal sources.
+4. Write and run a Python scraper — see "Build a scraper" above. Pick a \
+   target, write the script with `bash` (heredoc) or the text editor, run \
+   it with `python3`, and fold the parsed output into the beat book.
+5. Edit the file with the text editor's `str_replace` and `insert` \
+   commands. Use `bash` for utilities (count words, re-read, run scripts).
 6. When the file is meaningfully improved, your scraper has run \
    successfully, and you have no further useful research to add, call \
    `finalize_beat_book` once and stop.
@@ -617,7 +631,7 @@ async def run_research_agent(
     finalized = False
     container_id: Optional[str] = None
 
-    await _emit(on_progress, "starting", f"Opus 4.7 research agent initializing in sandbox {sandbox_dir.name}")
+    await _emit(on_progress, "starting", f"Sonnet 4.6 research agent initializing in sandbox {sandbox_dir.name}")
 
     for turn in range(MAX_TURNS):
         await _emit(on_progress, "thinking", f"Turn {turn + 1}/{MAX_TURNS}")
@@ -627,20 +641,24 @@ async def run_research_agent(
         # allocated we must thread its id back on every subsequent request or
         # the API returns: "container_id is required when there are pending
         # tool uses generated by code execution with tools."
-        # Opus 4.7 only supports adaptive thinking (the legacy
-        # type=enabled+budget_tokens shape returns 400). When the flag is off
-        # we send type=disabled — equivalent to omitting the field but makes
-        # the intent explicit in the request.
         request_kwargs: Dict[str, Any] = {
             "model": MODEL,
             "max_tokens": MAX_TOKENS_PER_TURN,
-            "system": system_prompt,
+            # System prompt is sent as a single cacheable block so each turn
+            # re-uses Anthropic's prompt cache. The suggested-sources list
+            # alone is ~5k tokens and identical across turns.
+            "system": [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             "tools": tools,
             "messages": messages,
-            "output_config": {"effort": "medium"},
-            "thinking": (
-                {"type": "adaptive"} if thinking_enabled() else {"type": "disabled"}
-            ),
+            # No extended thinking — Sonnet 4.6 handles the tool loop well
+            # without it, and the speed pass dwarfs any quality gain.
+            "thinking": {"type": "disabled"},
         }
         if container_id is not None:
             request_kwargs["container"] = container_id
@@ -651,11 +669,11 @@ async def run_research_agent(
         )
 
         def _stream_once():
-            # Streaming is required by the SDK for requests whose expected
-            # duration exceeds ~10 minutes. Opus 4.7 with adaptive thinking +
-            # medium effort + 32k max_tokens lands in that regime, so we stream
-            # and collect the final message. Run inside a thread so the async
-            # event loop (FastAPI's WebSocket handler) is never blocked.
+            # Streaming is used so the SDK can surface mid-stream
+            # message_start / message_delta events (we read container_id from
+            # them) and the call doesn't block on the long-lived web_search /
+            # web_fetch server tools. Run inside a thread so the async event
+            # loop (FastAPI's WebSocket handler) is never blocked.
             #
             # The server-tool container_id is delivered through mid-stream
             # message_start / message_delta events, not the consolidated
@@ -676,10 +694,37 @@ async def run_research_agent(
                             streamed_container_id = c.id
                 return stream.get_final_message(), streamed_container_id
 
-        try:
-            response, streamed_cid = await asyncio.to_thread(_stream_once)
-        except Exception as e:
-            raise RuntimeError(f"Opus 4.7 request failed on turn {turn + 1}: {e}") from e
+        last_err: Optional[Exception] = None
+        response = None
+        streamed_cid = None
+        for rl_attempt in range(TRANSIENT_RETRIES + 1):
+            try:
+                response, streamed_cid = await asyncio.to_thread(_stream_once)
+                last_err = None
+                break
+            except (
+                anthropic.RateLimitError,
+                anthropic.APIStatusError,
+                anthropic.APIConnectionError,
+                anthropic.APITimeoutError,
+            ) as e:
+                last_err = e
+                if rl_attempt >= TRANSIENT_RETRIES:
+                    break
+                await _emit(
+                    on_progress,
+                    "retrying",
+                    f"Transient error on turn {turn + 1}, attempt "
+                    f"{rl_attempt + 1}/{TRANSIENT_RETRIES + 1}: "
+                    f"{type(e).__name__}; retrying in "
+                    f"{TRANSIENT_PAUSE_SECONDS}s",
+                )
+                await asyncio.sleep(TRANSIENT_PAUSE_SECONDS)
+
+        if response is None:
+            raise RuntimeError(
+                f"Sonnet 4.6 request failed on turn {turn + 1}: {last_err}"
+            ) from last_err
 
         if streamed_cid is not None:
             container_id = streamed_cid

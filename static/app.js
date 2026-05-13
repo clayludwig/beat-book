@@ -515,13 +515,47 @@
     const m = Math.floor(secs / 60);
     const s = secs % 60;
     generatingElapsed.textContent = `${m}:${s.toString().padStart(2, "0")}`;
+    // Tick the active stage chip so its timer keeps moving.
+    renderStatsChips();
   }
 
   // ── Stepper state ────────────────────────────────────────────────────
   const STAGE_ORDER = ["review", "write", "research", "cite"];
+  const STAGE_LABELS = {
+    review: "Review",
+    write: "Write",
+    research: "Research",
+    cite: "Cite",
+  };
+
+  // Per-stage timing (for the testing/debug HUD). Tracks the wall-clock time
+  // spent in each pipeline stage. The active stage ticks live; completed
+  // stages freeze.
+  let activeStage = null;
+  const stageStartTs = {};      // stage -> Date.now() ms
+  const stageDurationsMs = {};  // stage -> committed duration (ms)
+
+  function commitStage(stage) {
+    if (!stage || !stageStartTs[stage]) return;
+    if (stageDurationsMs[stage] == null) {
+      stageDurationsMs[stage] = Date.now() - stageStartTs[stage];
+    }
+  }
+
+  function formatStageMs(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m}:${r.toString().padStart(2, "0")}`;
+  }
 
   function setStage(stage) {
     if (!stepperEl) return;
+    // Commit timing on the prior stage; start timing for the new one.
+    if (activeStage && activeStage !== stage) commitStage(activeStage);
+    if (stage && !stageStartTs[stage]) stageStartTs[stage] = Date.now();
+    activeStage = stage;
+
     const idx = STAGE_ORDER.indexOf(stage);
     stepperEl.querySelectorAll(".step").forEach(el => {
       const s = el.getAttribute("data-step");
@@ -530,6 +564,7 @@
       if (sIdx < idx) el.classList.add("done");
       else if (sIdx === idx) el.classList.add("active");
     });
+    renderStatsChips();
   }
 
   function markAllStagesDone() {
@@ -572,12 +607,29 @@
   function renderStatsChips() {
     if (!generatingStats) return;
     const parts = [];
+
+    // Per-stage timing chips: completed stages first, active stage last.
+    STAGE_ORDER.forEach(stage => {
+      if (!stageStartTs[stage]) return;
+      let ms = stageDurationsMs[stage];
+      let isActive = false;
+      if (ms == null) {
+        if (stage !== activeStage) return;
+        ms = Date.now() - stageStartTs[stage];
+        isActive = true;
+      }
+      parts.push({
+        label: `${STAGE_LABELS[stage]} <span class="chip-num">${formatStageMs(ms)}</span>`,
+        active: isActive,
+      });
+    });
+
     if (stats.storiesRead)  parts.push({ label: plural(stats.storiesRead, "story", "stories") + " read" });
     if (stats.searches)     parts.push({ label: plural(stats.searches, "search", "searches") + " run" });
     if (stats.topicsListed) parts.push({ label: plural(stats.topicsListed, "topic", "topics") + " explored" });
 
     generatingStats.innerHTML = parts
-      .map(p => `<span class="chip">${p.label}</span>`)
+      .map(p => `<span class="chip${p.active ? " chip-active" : ""}">${p.label}</span>`)
       .join("");
   }
 
@@ -803,6 +855,9 @@
     doneMarkdownLink.href = markdownPath;
     doneMarkdownLink.textContent = `Download raw Markdown (${msg.filename})`;
 
+    // Freeze the final stage timing before stopping the elapsed ticker.
+    commitStage(activeStage);
+    activeStage = null;
     markAllStagesDone();
     setShimmerDeterminate(1);
     stopElapsed();
@@ -811,9 +866,19 @@
     if (stats.storiesRead)  parts.push(plural(stats.storiesRead, "story", "stories") + " read");
     if (stats.searches)     parts.push(plural(stats.searches, "search", "searches") + " run");
     if (stats.topicsListed) parts.push(plural(stats.topicsListed, "topic", "topics") + " explored");
-    doneSubtitle.textContent = parts.length
-      ? `Built from ${parts.join(" · ")}.`
-      : "";
+
+    const totalMs = elapsedStart ? Date.now() - elapsedStart : 0;
+    const stageBits = STAGE_ORDER
+      .filter(s => stageDurationsMs[s] != null)
+      .map(s => `${STAGE_LABELS[s]} ${formatStageMs(stageDurationsMs[s])}`);
+
+    const sentences = [];
+    if (parts.length) sentences.push(`Built from ${parts.join(" · ")}.`);
+    if (totalMs > 0) {
+      const totalLabel = `Took ${formatStageMs(totalMs)} total`;
+      sentences.push(stageBits.length ? `${totalLabel} (${stageBits.join(" · ")}).` : `${totalLabel}.`);
+    }
+    doneSubtitle.textContent = sentences.join(" ");
 
     switchScreen("done");
   }

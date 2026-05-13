@@ -693,6 +693,16 @@ a:hover { text-decoration: underline; }
   font-variant-numeric: tabular-nums;
 }
 
+.chip-active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.chip-active .chip-num {
+  color: var(--accent);
+}
+
 .elapsed {
   font-variant-numeric: tabular-nums;
   color: var(--text-faint);

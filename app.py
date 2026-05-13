@@ -17,6 +17,7 @@ import asyncio
 import json
 import os
 import queue
+import time
 import uuid
 from pathlib import Path
 from typing import Dict, List
@@ -296,6 +297,7 @@ async def agent_ws(ws: WebSocket, session_id: str):
         sandbox_dir.mkdir(parents=True, exist_ok=True)
         (sandbox_dir / filename).write_text(markdown, encoding="utf-8")
 
+        research_start = time.monotonic()
         await ws.send_json({
             "type": "research_started",
             "filename": filename,
@@ -344,7 +346,16 @@ async def agent_ws(ws: WebSocket, session_id: str):
             })
             revised_markdown = markdown
 
-        await ws.send_json({"type": "research_complete"})
+        research_seconds = round(time.monotonic() - research_start, 2)
+        print(
+            f"[research_agent] finished in {research_seconds}s "
+            f"(session={session_id})",
+            flush=True,
+        )
+        await ws.send_json({
+            "type": "research_complete",
+            "seconds": research_seconds,
+        })
 
         # ── 3. Canonical output is the revised markdown ──────────────────
         filepath = OUTPUT_DIR / filename

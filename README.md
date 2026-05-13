@@ -6,6 +6,39 @@ Originally built around [Chicago Public Media](https://chicago.suntimes.com/) st
 
 ---
 
+## Changelog
+
+### 2026-05-13 — Faster research agent
+
+Cut the second-stage research agent (`research_agent.py`) from "multiple
+minutes / up to 30 turns" down to roughly 60–90 seconds per run while
+keeping the SUGGESTED_SOURCES reference block intact and keeping the
+reporter-facing Python scraper artifact as the standard output.
+
+- **Model:** Claude Opus 4.7 → Claude Sonnet 4.6 for the tool-loop.
+- **Turn cap:** `MAX_TURNS` 30 → 6.
+- **Per-turn output:** `MAX_TOKENS_PER_TURN` 32k → 4k.
+- **Web tools:** `WEB_SEARCH_MAX_USES` / `WEB_FETCH_MAX_USES` 20 → 5;
+  `WEB_FETCH_MAX_CONTENT_TOKENS` 50k → 15k.
+- **Extended thinking:** disabled (was Opus adaptive); `output_config`
+  effort knob removed.
+- **Prompt caching:** the system prompt is sent as a single
+  `cache_control: ephemeral` block so each turn re-uses Anthropic's
+  prompt cache (the SUGGESTED_SOURCES list alone is ~3–4k tokens and is
+  identical across turns).
+- **Retry shield:** transient `RateLimitError` / `APIStatusError` /
+  `APIConnectionError` / `APITimeoutError` now retry 3× with 10s spacing
+  before bubbling up.
+- **Scraper:** kept as a "SHOULD" with explicit guidance ("if it 4xx's,
+  switch sources — don't burn turns debugging").
+- **UI timing HUD:** per-stage live-ticking chips (Review / Write /
+  Research / Cite) on the generating screen; final total + per-stage
+  breakdown on the done screen. Server logs research-agent wall-clock
+  to stdout and rides a `seconds` field in the `research_complete`
+  WebSocket event.
+
+---
+
 ## Table of Contents
 
 - [How It Works](#how-it-works)
