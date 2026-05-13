@@ -67,21 +67,20 @@ NORMALIZE_MAX_ATTEMPTS = 2
 # windows and processed concurrently. WINDOW_OVERLAP must be larger than any
 # expected single-story body so a story spanning a boundary is fully contained
 # in one of the two adjacent windows.
-WINDOW_SIZE = 100_000           # primary chunk size in chars
+WINDOW_SIZE = 160_000           # primary chunk size in chars
 WINDOW_OVERLAP = 15_000          # chars of overlap between adjacent chunks
 # Soft safety cap on LLM calls per document. Sized to comfortably cover
 # the largest input the 25 MB raw-file cap could produce after extraction
-# (≈50 MB of HTML-stripped text at ~100 KB per chunk).
+# (≈50 MB of HTML-stripped text at ~160 KB per chunk).
 MAX_CHUNKS = 500
-# One chunk at a time per document. Anthropic's concurrent-request limits
-# are tight on lower tiers, and the SDK already retries 429s with
-# retry-after backoff, so serial keeps the request rate low enough that
-# big multi-chunk uploads stop tripping the limit at all.
-NORMALIZE_CONCURRENCY = 1
-# Sleep between chunks so requests don't fire back-to-back the instant
-# Anthropic frees a connection slot — gives their concurrent-connection
-# accounting a moment to settle between calls.
-INTER_CHUNK_PAUSE_SECONDS = 2.0
+# Per-document chunk concurrency. Multiple chunks of the same document
+# fan out to Anthropic in parallel; combined with app.py:_INGEST_CONCURRENCY
+# this caps the peak in-flight request count. The SDK's 429 handling and
+# our own RateLimitError retry loop ride out brief concurrent-limit spikes.
+NORMALIZE_CONCURRENCY = 8
+# No inter-chunk pause — every second of sleep is a second off the 1–3 min
+# pipeline budget. Rate-limit retries handle the rare overshoot.
+INTER_CHUNK_PAUSE_SECONDS = 0.0
 # Record separator emitted by _extract_json for top-level JSON lists.
 # When present in the extracted text, _make_chunks packs whole records
 # into each chunk so a story body is never split across two chunks.

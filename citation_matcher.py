@@ -6,16 +6,20 @@ stories, embeds each sentence with OpenAI `text-embedding-3-small`, and for
 each sentence in the beat book finds the most similar source sentence by
 cosine similarity.
 
+Matching is fully vectorized: source-sentence embeddings stack into one
+(S, 1536) matrix, beat-book sentence embeddings stack into (B, 1536), and a
+single `B @ S.T` matrix multiply replaces the pre-numpy nested Python loop.
+
 Public entry points:
 - embed_source_stories(stories, openai_key, on_progress) -> list[dict]
 - markdown_to_beatbook_entries(markdown, source_embeddings, openai_key, on_progress) -> list[dict]
 - build_sources_file(stories, source_embeddings) -> list[dict]
 """
 
-import math
 import re
-from typing import Callable, List, Dict, Any, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import numpy as np
 from openai import OpenAI
 
 # Progress callback signature: (stage_label, fraction_0_to_1, detail)
@@ -255,47 +259,94 @@ def embed_source_stories(
 # MATCHING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _cosine_similarity(a: List[float], b: List[float]) -> float:
-    dot = 0.0
-    mag_a = 0.0
-    mag_b = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        mag_a += x * x
-        mag_b += y * y
-    if mag_a == 0 or mag_b == 0:
-        return 0.0
-    return dot / (math.sqrt(mag_a) * math.sqrt(mag_b))
+def _l2_normalize(matrix: np.ndarray) -> np.ndarray:
+    """Row-wise L2 normalize. Zero rows pass through (divisor floor of 1)."""
+    if matrix.size == 0:
+        return matrix
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return matrix / norms
 
 
-def _find_best_match(embedding: List[float], source_embeddings: List[Dict[str, Any]]) -> Dict[str, Any]:
-    best = {
-        "article_id": None,
-        "sentence_text": "",
-        "sentence_index": -1,
-        "similarity": -1.0,
-        "article_title": "",
-        "article_date": "",
-        "article_author": "",
+def _empty_match() -> Dict[str, Any]:
+    return {
+        "article_id":      None,
+        "sentence_text":   "",
+        "sentence_index":  -1,
+        "similarity":      -1.0,
+        "article_title":   "",
+        "article_date":    "",
+        "article_author":  "",
     }
+
+
+def _build_source_matrix(
+    source_embeddings: List[Dict[str, Any]],
+) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    """Stack every source-sentence embedding into one (S, D) matrix and
+    return a parallel metadata list of length S. Rows are L2-normalized
+    once here so the per-query call is a pure dot product."""
+    flat: List[List[float]] = []
+    meta: List[Dict[str, Any]] = []
     for article in source_embeddings:
-        aid = article.get("article_id", "")
-        for sentence_data in article.get("sentences", []):
-            emb = sentence_data.get("embedding")
+        aid    = article.get("article_id", "")
+        title  = article.get("title", "")
+        date   = article.get("date", "")
+        author = article.get("author", "")
+        for sent in article.get("sentences") or []:
+            emb = sent.get("embedding")
             if emb is None:
                 continue
-            sim = _cosine_similarity(embedding, emb)
-            if sim > best["similarity"]:
-                best = {
-                    "article_id": aid,
-                    "sentence_text": sentence_data.get("text", ""),
-                    "sentence_index": sentence_data.get("index", 0),
-                    "similarity": sim,
-                    "article_title": article.get("title", ""),
-                    "article_date": article.get("date", ""),
-                    "article_author": article.get("author", ""),
-                }
-    return best
+            flat.append(emb)
+            meta.append({
+                "article_id":      aid,
+                "sentence_text":   sent.get("text", ""),
+                "sentence_index":  sent.get("index", 0),
+                "article_title":   title,
+                "article_date":    date,
+                "article_author":  author,
+            })
+    if not flat:
+        return np.zeros((0, 0), dtype=np.float32), []
+    matrix = np.asarray(flat, dtype=np.float32)
+    return _l2_normalize(matrix), meta
+
+
+def _find_best_matches_batch(
+    query_embs: np.ndarray,
+    source_matrix: np.ndarray,
+    source_meta: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Best-match every row of `query_embs` against the source matrix in
+    one BLAS call. Returns a list parallel to query_embs.
+
+    Both matrices are assumed to share an embedding dimension; the source
+    matrix is already L2-normalized (see _build_source_matrix), the
+    queries are normalized here.
+    """
+    if query_embs.size == 0:
+        return []
+    if source_matrix.size == 0:
+        return [_empty_match() for _ in range(query_embs.shape[0])]
+
+    Q = _l2_normalize(query_embs.astype(np.float32))
+    sims = Q @ source_matrix.T            # (B, S), cosine since both normalized
+    best_idx = sims.argmax(axis=1)
+    best_sim = sims[np.arange(sims.shape[0]), best_idx]
+
+    out: List[Dict[str, Any]] = []
+    for b in range(sims.shape[0]):
+        meta = source_meta[int(best_idx[b])]
+        out.append({
+            "article_id":      meta["article_id"],
+            "sentence_text":   meta["sentence_text"],
+            "sentence_index":  meta["sentence_index"],
+            "similarity":      float(best_sim[b]),
+            "article_title":   meta["article_title"],
+            "article_date":    meta["article_date"],
+            "article_author":  meta["article_author"],
+        })
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -312,55 +363,59 @@ def markdown_to_beatbook_entries(
 
     Each entry has: content, source, source_sentence, source_sentence_index,
     source_title, similarity.
+
+    Matching is vectorized: every beat-book sentence's embedding is dotted
+    against the stacked, L2-normalized source matrix in a single BLAS call.
     """
     client = OpenAI(api_key=openai_key)
 
     entries = _segment_markdown(markdown)
     to_embed_indices = [i for i, e in enumerate(entries) if e["needs_embedding"] and e["content"].strip()]
     to_embed_texts = [entries[i]["content"] for i in to_embed_indices]
+    total_to_match = len(to_embed_indices)
 
     if on_progress:
-        on_progress("embedding_beatbook", 0.0, f"{len(to_embed_texts)} sentences to match")
+        on_progress("embedding_beatbook", 0.0, f"{total_to_match} sentences to match")
 
-    embeddings = _embed_many(client, to_embed_texts, on_progress, "embedding_beatbook")
+    raw_embeddings = _embed_many(client, to_embed_texts, on_progress, "embedding_beatbook")
 
-    # Walk through entries and assemble the output.
+    if on_progress:
+        on_progress("matching", 0.0, "Building source matrix...")
+    source_matrix, source_meta = _build_source_matrix(source_embeddings)
+
+    if raw_embeddings:
+        query_matrix = np.asarray(raw_embeddings, dtype=np.float32)
+    else:
+        query_matrix = np.zeros((0, 0), dtype=np.float32)
+
+    matches = _find_best_matches_batch(query_matrix, source_matrix, source_meta)
+    if on_progress:
+        on_progress("matching", 1.0, f"{total_to_match}/{total_to_match}")
+
+    # Reassemble entries in original order, splicing match metadata into
+    # the rows that needed embedding.
     out: List[Dict[str, Any]] = []
-    embed_iter = iter(zip(to_embed_indices, embeddings))
-    next_embed = next(embed_iter, None)
-
-    total_to_match = len(to_embed_indices)
-    matched = 0
-
+    match_by_entry_idx = dict(zip(to_embed_indices, matches))
     for i, entry in enumerate(entries):
-        if next_embed is not None and next_embed[0] == i:
-            _, emb = next_embed
-            match = _find_best_match(emb, source_embeddings)
-            out.append(
-                {
-                    "content": entry["content"],
-                    "source": match["article_id"] or "",
-                    "source_sentence": match["sentence_text"] or "",
-                    "source_sentence_index": match["sentence_index"] if match["sentence_index"] is not None else -1,
-                    "source_title": match["article_title"],
-                    "similarity": round(match["similarity"], 4),
-                }
-            )
-            next_embed = next(embed_iter, None)
-            matched += 1
-            if on_progress and (matched % 25 == 0 or matched == total_to_match):
-                on_progress("matching", matched / total_to_match if total_to_match else 1.0, f"{matched}/{total_to_match}")
-        else:
-            out.append(
-                {
-                    "content": entry["content"],
-                    "source": "",
-                    "source_sentence": "",
-                    "source_sentence_index": -1,
-                    "source_title": "",
-                    "similarity": 0.0,
-                }
-            )
+        m = match_by_entry_idx.get(i)
+        if m is None:
+            out.append({
+                "content":                entry["content"],
+                "source":                 "",
+                "source_sentence":        "",
+                "source_sentence_index":  -1,
+                "source_title":           "",
+                "similarity":             0.0,
+            })
+            continue
+        out.append({
+            "content":                entry["content"],
+            "source":                 m["article_id"] or "",
+            "source_sentence":        m["sentence_text"] or "",
+            "source_sentence_index":  m["sentence_index"] if m["sentence_index"] is not None else -1,
+            "source_title":           m["article_title"],
+            "similarity":             round(m["similarity"], 4),
+        })
 
     return out
 

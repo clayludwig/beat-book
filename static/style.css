@@ -768,6 +768,31 @@ a:hover { text-decoration: underline; }
   text-decoration-color: var(--text);
 }
 
+.research-section {
+  margin-top: 2rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border-strong);
+  text-align: center;
+}
+
+.research-section .btn {
+  margin-bottom: 0.6rem;
+}
+
+.research-section .btn[disabled] {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.research-explain {
+  font-family: var(--sans);
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  max-width: 32rem;
+  margin: 0 auto;
+  line-height: 1.45;
+}
+
 /* ── Scrollbar ────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar {
   width: 8px;

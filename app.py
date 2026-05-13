@@ -19,7 +19,7 @@ import os
 import queue
 import uuid
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
@@ -50,10 +50,11 @@ from ingest import ingest_file, ingest_url
 
 app = FastAPI(title="Beat Book Builder")
 
-# Files-in-flight per /ingest request. Serial so a multi-file upload
-# doesn't multiply concurrent Claude calls against Anthropic's per-tier
-# concurrent-request limit (ingest.py itself runs chunks serially too).
-_INGEST_CONCURRENCY = 1
+# Files-in-flight per /ingest request. Combined with ingest.py's per-file
+# chunk concurrency, this sets the peak number of normalize calls in flight
+# (≈ _INGEST_CONCURRENCY × NORMALIZE_CONCURRENCY). Tuned to keep big
+# multi-file uploads finishing in under a minute on Haiku 4.5.
+_INGEST_CONCURRENCY = 10
 
 # In-memory session store: session_id → PipelineResult
 sessions: Dict[str, PipelineResult] = {}
@@ -280,81 +281,17 @@ async def agent_ws(ws: WebSocket, session_id: str):
             lines.append("")
         return "\n".join(lines)
 
-    async def on_beat_book(filename: str, markdown: str):
-        """Run the research agent on the first agent's draft, then hand the
-        revised markdown to the citation matcher.
+    # Mutable session state — the optional research stage reads back the
+    # most recent filename + markdown the writer produced, so the user can
+    # click "Deepen with research" any time after the first delivery.
+    state: Dict[str, Optional[str]] = {"filename": None, "markdown": None}
 
-        Pipeline: draft md → research agent (sandboxed) → revised md → citations.
-        """
-        # ── 1. Persist the raw draft so the user can fall back to it ─────
+    async def _run_citations(markdown: str, filename: str) -> None:
+        """Embed sources + beat-book sentences, write JSON outputs, and
+        push the final beat_book event over the WebSocket. Used both by
+        the initial draft handoff and after the optional research stage."""
         stem = Path(filename).stem
-        draft_path = OUTPUT_DIR / f"{stem}.draft.md"
-        draft_path.write_text(markdown, encoding="utf-8")
 
-        # ── 2. Prepare a per-session sandbox for the research agent ──────
-        sandbox_dir = SANDBOX_ROOT / session_id
-        sandbox_dir.mkdir(parents=True, exist_ok=True)
-        (sandbox_dir / filename).write_text(markdown, encoding="utf-8")
-
-        await ws.send_json({
-            "type": "research_started",
-            "filename": filename,
-        })
-
-        async def on_research_progress(stage: str, detail: str):
-            await ws.send_json({
-                "type": "research_progress",
-                "stage": stage,
-                "detail": detail,
-            })
-
-        async def on_research_tool_status(tool_name: str, desc: str, detail: str):
-            await ws.send_json({
-                "type": "research_tool_status",
-                "tool_name": tool_name,
-                "tool": desc,
-                "detail": detail,
-            })
-
-        async def on_research_text(text: str):
-            await ws.send_json({
-                "type": "research_message",
-                "text": text,
-            })
-
-        try:
-            revised_markdown = await run_research_agent(
-                sandbox_dir=sandbox_dir,
-                markdown_filename=filename,
-                interview_log=interview_log,
-                anthropic_api_key=anthropic_key,
-                on_progress=on_research_progress,
-                on_tool_status=on_research_tool_status,
-                on_text=on_research_text,
-            )
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            await ws.send_json({
-                "type": "error",
-                "text": (
-                    f"Research agent failed ({type(e).__name__}: {e}). "
-                    "Falling back to the first agent's draft."
-                ),
-            })
-            revised_markdown = markdown
-
-        await ws.send_json({"type": "research_complete"})
-
-        # ── 3. Canonical output is the revised markdown ──────────────────
-        filepath = OUTPUT_DIR / filename
-        filepath.write_text(revised_markdown, encoding="utf-8")
-        await ws.send_json({
-            "type": "beat_book_markdown_saved",
-            "filename": filename,
-        })
-
-        # Citation matching uses OpenAI embeddings (Anthropic has no embedding API).
         openai_key = os.environ.get("OPENAI_API_KEY", "")
         if not openai_key:
             await ws.send_json({
@@ -364,7 +301,6 @@ async def agent_ws(ws: WebSocket, session_id: str):
             return
 
         stories = pipeline_result.stories
-
         citation_progress_queue: queue.Queue = queue.Queue()
 
         def on_matcher_progress(stage: str, fraction: float, detail: str):
@@ -372,15 +308,15 @@ async def agent_ws(ws: WebSocket, session_id: str):
 
         def run_matcher():
             source_embeddings = embed_source_stories(stories, openai_key, on_matcher_progress)
-            entries = markdown_to_beatbook_entries(revised_markdown, source_embeddings, openai_key, on_matcher_progress)
+            entries = markdown_to_beatbook_entries(markdown, source_embeddings, openai_key, on_matcher_progress)
             sources = build_sources_file(stories, source_embeddings)
             return entries, sources
 
         await ws.send_json({
-            "type": "citation_progress",
-            "stage": "starting",
+            "type":     "citation_progress",
+            "stage":    "starting",
             "fraction": 0.0,
-            "detail": "Embedding source sentences…",
+            "detail":   "Embedding source sentences...",
         })
 
         loop = asyncio.get_event_loop()
@@ -406,18 +342,112 @@ async def agent_ws(ws: WebSocket, session_id: str):
             })
             return
 
-        json_path = OUTPUT_DIR / f"{stem}.json"
+        json_path    = OUTPUT_DIR / f"{stem}.json"
         sources_path = OUTPUT_DIR / f"{stem}_sources.json"
         json_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
         sources_path.write_text(json.dumps(sources, indent=2, ensure_ascii=False), encoding="utf-8")
 
         await ws.send_json({
-            "type": "beat_book",
-            "filename": filename,
+            "type":          "beat_book",
+            "filename":      filename,
             "markdown_path": f"/output/{quote(filename)}",
-            "viewer_url": f"/static/viewer/viewer.html?book={quote(stem)}",
-            "stem": stem,
+            "viewer_url":    f"/static/viewer/viewer.html?book={quote(stem)}",
+            "stem":          stem,
         })
+
+    async def on_beat_book(filename: str, markdown: str) -> None:
+        """First-stage handoff. Save the draft + run citations. The Opus 4.7
+        research stage is opt-in and runs only when the frontend explicitly
+        requests it via {"action": "research"} on this WebSocket."""
+        stem       = Path(filename).stem
+        draft_path = OUTPUT_DIR / f"{stem}.draft.md"
+        draft_path.write_text(markdown, encoding="utf-8")
+
+        filepath = OUTPUT_DIR / filename
+        filepath.write_text(markdown, encoding="utf-8")
+
+        state["filename"] = filename
+        state["markdown"] = markdown
+
+        await ws.send_json({
+            "type":     "beat_book_markdown_saved",
+            "filename": filename,
+        })
+        await _run_citations(markdown, filename)
+
+    async def _run_research_stage() -> None:
+        """Run the Opus 4.7 research agent against the most recent draft,
+        then re-run citations on the revised markdown. No-op if there's
+        no saved markdown yet."""
+        filename = state.get("filename")
+        markdown = state.get("markdown")
+        if not filename or not markdown:
+            await ws.send_json({
+                "type": "error",
+                "text": "No beat book has been generated yet; cannot run research.",
+            })
+            return
+
+        sandbox_dir = SANDBOX_ROOT / session_id
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
+        (sandbox_dir / filename).write_text(markdown, encoding="utf-8")
+
+        await ws.send_json({"type": "research_started", "filename": filename})
+
+        async def on_research_progress(stage: str, detail: str):
+            await ws.send_json({
+                "type":   "research_progress",
+                "stage":  stage,
+                "detail": detail,
+            })
+
+        async def on_research_tool_status(tool_name: str, desc: str, detail: str):
+            await ws.send_json({
+                "type":      "research_tool_status",
+                "tool_name": tool_name,
+                "tool":      desc,
+                "detail":    detail,
+            })
+
+        async def on_research_text(text: str):
+            await ws.send_json({
+                "type": "research_message",
+                "text": text,
+            })
+
+        try:
+            revised_markdown = await run_research_agent(
+                sandbox_dir=sandbox_dir,
+                markdown_filename=filename,
+                interview_log=interview_log,
+                anthropic_api_key=anthropic_key,
+                on_progress=on_research_progress,
+                on_tool_status=on_research_tool_status,
+                on_text=on_research_text,
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            await ws.send_json({
+                "type": "error",
+                "text": (
+                    f"Research agent failed ({type(e).__name__}: {e}). "
+                    "The original draft remains available."
+                ),
+            })
+            return
+
+        await ws.send_json({"type": "research_complete"})
+
+        filepath = OUTPUT_DIR / filename
+        filepath.write_text(revised_markdown, encoding="utf-8")
+        state["markdown"] = revised_markdown
+
+        await ws.send_json({
+            "type":     "beat_book_markdown_saved",
+            "filename": filename,
+        })
+        await _run_citations(revised_markdown, filename)
 
     async def on_tool_status(tool_name: str, tool_desc: str, detail: str):
         """Send tool execution status to frontend."""
@@ -434,6 +464,7 @@ async def agent_ws(ws: WebSocket, session_id: str):
         await run_agent(
             pipeline_result=pipeline_result,
             anthropic_key=anthropic_key,
+            interview_log=interview_log,
             on_interview=on_interview,
             on_message=on_message,
             on_beat_book=on_beat_book,
@@ -441,12 +472,45 @@ async def agent_ws(ws: WebSocket, session_id: str):
         )
     except WebSocketDisconnect:
         print(f"Session {session_id}: client disconnected.")
+        return
     except Exception as e:
         try:
             await ws.send_json({"type": "error", "text": f"Agent error: {str(e)}"})
         except Exception:
             pass
         raise
+
+    # The agent has delivered the first beat book + citations. Keep the
+    # WebSocket open and wait for optional user actions — the research
+    # stage runs only on explicit request ({"action": "research"}).
+    while True:
+        try:
+            msg = await ws.receive_json()
+        except WebSocketDisconnect:
+            print(f"Session {session_id}: client disconnected after delivery.")
+            return
+        except Exception:
+            # Malformed message — keep the connection alive.
+            continue
+
+        action = (msg or {}).get("action") if isinstance(msg, dict) else None
+        if action == "research":
+            try:
+                await _run_research_stage()
+            except WebSocketDisconnect:
+                return
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                try:
+                    await ws.send_json({
+                        "type": "error",
+                        "text": f"Research stage failed: {type(e).__name__}: {e}",
+                    })
+                except Exception:
+                    pass
+        elif action == "close":
+            return
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -43,6 +43,8 @@
   const doneSubtitle    = document.getElementById("done-subtitle");
   const doneViewerLink  = document.getElementById("done-viewer-link");
   const doneMarkdownLink = document.getElementById("done-markdown-link");
+  const researchBtn     = document.getElementById("research-btn");
+  const researchSection = document.getElementById("research-section");
 
   const sessionInfoEls = document.querySelectorAll(
     "#preview-session-info, #interview-session-info, #generating-session-info, #done-session-info"
@@ -393,13 +395,23 @@
 
   // ── Run pipeline ─────────────────────────────────────────────────────
   const STEP_LABELS = {
-    embedding: "Generating embeddings",
-    reducing:  "Reducing dimensions",
+    embedding:  "Generating embeddings",
+    reducing:   "Reducing dimensions",
     clustering: "Clustering stories",
-    labeling:  "Labeling topics",
+    labeling:   "Labeling topics",
+    briefings:  "Building topic briefings",
   };
-  const STEP_WEIGHTS = { embedding: 0.30, reducing: 0.10, clustering: 0.10, labeling: 0.50 };
-  const STEP_ORDER   = ["embedding", "reducing", "clustering", "labeling"];
+  // Wall-clock weights reflect post-Haiku, post-batching reality: labeling
+  // is now one call (cheap) and briefings are the bulk of the pipeline's
+  // LLM time.
+  const STEP_WEIGHTS = {
+    embedding:  0.25,
+    reducing:   0.05,
+    clustering: 0.05,
+    labeling:   0.10,
+    briefings:  0.55,
+  };
+  const STEP_ORDER = ["embedding", "reducing", "clustering", "labeling", "briefings"];
 
   function calcOverall(step, fraction) {
     let total = 0;
@@ -637,6 +649,8 @@
           break;
 
         case "research_complete":
+          researchInFlight = false;
+          researchCompleted = true;
           setGenerating("Research complete", "Handing off to citation matcher…");
           break;
 
@@ -795,6 +809,12 @@
   }
 
   // ── Done screen ──────────────────────────────────────────────────────
+  // Research stage state: set true while the Opus research run is in
+  // flight, so a duplicate beat_book event after research swaps the
+  // button into a "research complete" affordance instead of resetting it.
+  let researchInFlight = false;
+  let researchCompleted = false;
+
   function showDone(msg) {
     const viewerUrl = msg.viewer_url || `/static/viewer/viewer.html?book=${encodeURIComponent(msg.stem || "")}`;
     const markdownPath = msg.markdown_path || `/output/${encodeURIComponent(msg.filename)}`;
@@ -815,7 +835,46 @@
       ? `Built from ${parts.join(" · ")}.`
       : "";
 
+    // Reset / set the research button. After a successful research run we
+    // keep it disabled so the user doesn't accidentally re-trigger.
+    if (researchBtn && researchSection) {
+      researchInFlight = false;
+      if (researchCompleted) {
+        researchBtn.textContent = "Web research applied";
+        researchBtn.disabled = true;
+        const explain = researchSection.querySelector(".research-explain");
+        if (explain) {
+          explain.textContent = "The Opus research agent has already enriched this draft.";
+        }
+      } else {
+        researchBtn.textContent = "Deepen with web research";
+        researchBtn.disabled = false;
+      }
+    }
+
     switchScreen("done");
+  }
+
+  if (researchBtn) {
+    researchBtn.addEventListener("click", () => {
+      if (researchInFlight || researchCompleted) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        alert("The session has closed. Please start a new beat book to run web research.");
+        return;
+      }
+      researchInFlight = true;
+      researchBtn.disabled = true;
+      researchBtn.textContent = "Researching…";
+
+      // Reset the generating screen for the research stage.
+      setGenerating("Researching context", "Opening the research sandbox…");
+      setStage("research");
+      setShimmerIndeterminate();
+      startElapsed();
+      switchScreen("generating");
+
+      ws.send(JSON.stringify({ action: "research" }));
+    });
   }
 
 })();

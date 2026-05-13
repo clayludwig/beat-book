@@ -1,71 +1,77 @@
 """
 agent.py
 --------
-Claude-powered agent (Sonnet 4.6) that has tools to explore stories/
-topics and interview the reporter, then produces a beat book.
+Haiku-driven planning agent. Its job is narrow:
 
-The agent runs in an async loop.  Most tools execute locally, but
-`interview_user` pauses execution and sends the question to the frontend
-via a callback.  The callback returns the user's answer so the loop can
-resume.
+  1. Survey the topic landscape (the topic briefings produced by
+     pipeline.build_briefings are injected into the system prompt).
+  2. Run ONE round of interview_user to learn the reporter's beat
+     selection, audience, and emphasis.
+  3. Call generate_beat_book with a slim plan (filename, beat selection,
+     focus notes). The actual prose is synthesized by a single Sonnet
+     pass against the same briefings — see _generate_final_beat_book.
+
+The old "must read half of every topic before publishing" research gate
+is gone. Briefings already capture the corpus; the original story-level
+tools (read_story / list_stories_in_topic / search_stories) remain
+available for optional verification.
 """
 
 import asyncio
 import json
-from typing import Callable, Awaitable
+from typing import Awaitable, Callable, List, Optional
 
 import anthropic
 
-from pipeline import PipelineResult
+from pipeline import PipelineResult, render_briefings_markdown, strip_quotes
 from claude_client import (
     CHAT_MODEL,
+    DRAFT_MODEL,
     RATE_LIMIT_MAX_RETRIES,
     RATE_LIMIT_PAUSE_SECONDS,
     chat_client,
     thinking_param,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MODEL
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# MODELS
+# ────────────────────────────────────────────────────────────────────────
 
-AGENT_MODEL = CHAT_MODEL
+AGENT_MODEL  = CHAT_MODEL    # Haiku 4.5 drives the planning / interview loop
+WRITER_MODEL = DRAFT_MODEL   # Sonnet 4.6 writes the final prose
 
-# Generous output cap — beat books can be long. Sonnet 4.6 supports a
-# 1M token context window and up to 128k output tokens; 32k per turn is
-# plenty for a beat-book draft plus a few tool calls.
-MAX_TOKENS_PER_TURN = 32768
+LOOP_MAX_TOKENS  = 8192      # per turn in the planning loop
+DRAFT_MAX_TOKENS = 32768     # one Sonnet call to produce the full beat book
+MAX_TURNS        = 10        # soft cap — most sessions finish in 3-5 turns
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TOOL DEFINITIONS (Anthropic tool-use schema)
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ────────────────────────────────────────────────────────────────────────
+# TOOL SCHEMAS
+# ────────────────────────────────────────────────────────────────────────
 
 TOOLS = [
     {
         "name": "view_topics",
         "description": (
-            "View all discovered topics from the uploaded stories. Returns broad "
-            "and specific topics with story counts. Use this first to understand "
-            "the landscape of coverage."
+            "Re-list the broad and specific topics with story counts. The "
+            "topic briefings are already in your system prompt; use this "
+            "only if you want a compact recap."
         ),
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
         "name": "list_stories_in_topic",
         "description": (
-            "List all stories that belong to a given topic. Returns story index, "
-            "title, and date for each."
+            "List the stories in a given topic — index, title, date. "
+            "Optional: only call this if you want to verify or quote a "
+            "specific story beyond what the briefing already captures."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "topic": {
                     "type": "string",
-                    "description": "The exact topic label to look up.",
+                    "description": "Exact topic label (case-sensitive).",
                 },
             },
             "required": ["topic"],
@@ -74,8 +80,8 @@ TOOLS = [
     {
         "name": "read_story",
         "description": (
-            "Read the full content of a story by its index number. Returns title, "
-            "author, date, and full text."
+            "Read the full content of a story by index. Optional verification "
+            "tool — the briefings already include representative excerpts."
         ),
         "input_schema": {
             "type": "object",
@@ -91,15 +97,15 @@ TOOLS = [
     {
         "name": "search_stories",
         "description": (
-            "Search stories by keyword. Returns matching story indices, titles, "
-            "and dates."
+            "Keyword search across all story titles and content. Optional "
+            "verification tool."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Keyword or phrase to search for in story titles and content.",
+                    "description": "Keyword or phrase to search for.",
                 },
             },
             "required": ["query"],
@@ -108,44 +114,39 @@ TOOLS = [
     {
         "name": "interview_user",
         "description": (
-            "Ask the reporter a BATCH of interview questions in a single form. "
-            "The reporter fills out all questions at once and submits. Strongly "
-            "prefer asking 3–6 related questions in one call over many separate "
-            "calls — it gives the reporter context for what you're trying to "
-            "learn and avoids a tedious back-and-forth. Only call this tool a "
-            "second time if a follow-up is genuinely necessary based on their "
-            "first answers.\n\n"
+            "Ask the reporter a BATCH of interview questions in a single "
+            "form. Strongly prefer asking 4-6 related questions in one call. "
+            "The first question MUST be a checklist of broad topic labels "
+            "so the reporter selects which topics form their beat.\n\n"
             "Each question supports one of four input types:\n"
-            "- 'checklist': multi-select checkboxes (use for 'select all that apply')\n"
-            "- 'single_choice': radio buttons — pick exactly one\n"
+            "- 'checklist': multi-select checkboxes\n"
+            "- 'single_choice': radio buttons — pick one\n"
             "- 'multiple_choice': checkboxes — pick one or more\n"
-            "- 'free_response': open text input\n"
+            "- 'free_response': open text input"
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "intro": {
                     "type": "string",
-                    "description": "Optional 1–2 sentence intro shown above the form to frame what you're asking and why.",
+                    "description": "Optional 1-2 sentence intro framing the form.",
                 },
                 "questions": {
                     "type": "array",
-                    "description": "Ordered list of questions to present in one form (3–6 recommended).",
+                    "description": "Ordered questions (4-6 recommended).",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "question": {
-                                "type": "string",
-                                "description": "The question text.",
-                            },
+                            "question":      {"type": "string"},
                             "question_type": {
                                 "type": "string",
-                                "enum": ["checklist", "single_choice", "multiple_choice", "free_response"],
+                                "enum": ["checklist", "single_choice",
+                                         "multiple_choice", "free_response"],
                             },
                             "options": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "Options for checklist / single_choice / multiple_choice. Leave empty for free_response.",
+                                "description": "Options for non-free questions. Empty for free_response.",
                             },
                         },
                         "required": ["question", "question_type"],
@@ -158,165 +159,123 @@ TOOLS = [
     {
         "name": "generate_beat_book",
         "description": (
-            "Write the final beat book as a Markdown document. Call this once you "
-            "have gathered enough information from the topics, stories, and the "
-            "reporter's answers. The content you pass will be saved as the output file."
+            "Trigger the final beat book draft. You do NOT write the prose "
+            "yourself — a writer model will synthesize the Markdown from the "
+            "briefings + interview answers + the inputs you pass here. "
+            "Call this once you have the reporter's answers."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "markdown_content": {
-                    "type": "string",
-                    "description": "The complete beat book in Markdown format.",
-                },
                 "filename": {
                     "type": "string",
-                    "description": "Filename for the beat book (e.g. 'sports_beat_book.md').",
+                    "description": "Output filename, kebab-case, ending in .md (e.g. 'school-board-beat-book.md').",
+                },
+                "beat_selection": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of broad-topic labels (exact spelling) that the reporter selected as their beat.",
+                },
+                "focus_notes": {
+                    "type": "string",
+                    "description": (
+                        "2-4 sentences distilling the reporter's interview "
+                        "answers into emphasis instructions for the writer: "
+                        "which topics matter most, what audience knowledge "
+                        "to assume, what angles to lead with, what tone."
+                    ),
                 },
             },
-            "required": ["markdown_content", "filename"],
+            "required": ["filename", "beat_selection", "focus_notes"],
         },
     },
 ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SYSTEM PROMPT
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# SYSTEM PROMPT (two text blocks: static prefix + cached briefings)
+# ────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """\
-You are an expert journalism mentor and beat-book author. Your job is to help \
-a reporter create a comprehensive "beat book" — a practical reporting guide for \
-covering a specific beat (topic area).
+_SYSTEM_PREFIX = """\
+You are a journalism mentor running the interview step of a beat-book \
+builder. The reporter has uploaded a corpus of news stories; an upstream \
+pipeline has clustered them into broad topics and produced a structured \
+briefing per topic. Those briefings appear later in this system prompt \
+and are your primary source — the final beat book will be written from \
+them by a separate writer model.
 
-You have been given a set of news stories that the reporter has uploaded. These \
-stories have already been analyzed and grouped into topics automatically.
+Your job is narrow and short:
 
-Your workflow:
-1. **Explore** — Start by using `view_topics` to see what topics exist in the \
-stories. Read a few representative stories to understand the coverage.
-2. **Interview** — Call `interview_user` ONCE with a batch of 4–6 questions. \
-Include a short `intro` framing what you're trying to learn. Start the batch \
-with a checklist of the discovered topics so they can select which form their \
-beat, then add questions about audience, experience level, and what they need \
-most from the guide. Only call `interview_user` a second time if a follow-up \
-is truly essential based on their answers.
-3. **Research thoroughly** — This is the longest step, and the quality of \
-the beat book is directly proportional to how much of the corpus you have \
-actually read. For each topic the reporter selected, call \
-`list_stories_in_topic` first to see what is there, then read a substantial \
-sample. At minimum, read half the stories in every selected topic; when a \
-topic has fewer than 15 stories, read every one. Use `search_stories` to \
-surface specific people, institutions, and themes once you start noticing \
-patterns. Every `list_stories_in_topic` / `read_story` / `search_stories` \
-tool result includes a `[Research progress]` block that tells you, per \
-topic, how many stories you've read out of the target — use it to track \
-where you still need depth. The system will refuse `generate_beat_book` \
-calls until every listed topic has met its target, so do not bother trying \
-to short-circuit; just keep reading.
-4. **Generate** — Once every listed topic shows "OK" in the progress block, \
-call `generate_beat_book` with a polished Markdown document. You have a \
-40-turn budget — using most of it on research is the expected behavior, \
-not a problem.
+1. Review the topic landscape and the per-topic briefings (below). \
+You do not need to call view_topics first — the briefings already \
+contain the labels, story counts, and a digest of each topic.
 
-The beat book is a narrative document, not an outline. A reporter should be \
-able to read it cover-to-cover the way they'd read a long-form magazine \
-feature about their own beat. Structure it as follows.
+2. Call interview_user ONCE with 4-6 questions:
+   - Question 1 MUST be a 'checklist' of the broad topic labels \
+exactly as written below, so the reporter selects which topics form \
+their beat.
+   - Questions 2-6 probe: who the reporter is writing for, their \
+experience level on this beat (newcomer vs. veteran), specific \
+angles or storylines they care about, and what they most want from \
+the beat book (story ideas, sourcing tips, background, etc.).
 
-Open with a **Beat Overview** of two or three paragraphs explaining what the \
-beat covers and why it matters — written as prose, not as bullets. Move into \
-**Key Topics & Themes**, organized around the topics the reporter selected; \
-each topic gets a few paragraphs describing who is doing what, what is at \
-stake, and the recurring tension or arc in the coverage. Cover **Key Sources \
-& Players** — the people, organizations, and institutions that appear \
-repeatedly — by writing about them in sentences, explaining their role and \
-how they tend to surface; do not reduce them to a bulleted roster. **Story \
-Ideas & Angles** can be a short numbered list because each idea is a \
-discrete thought, but introduce the list with a sentence or two framing the \
-gap in coverage it addresses. Provide **Background & Context** as flowing \
-prose: the history, policy, and institutional knowledge a new reporter would \
-need to make sense of the beat. End with **Reporting Tips** (a few sentences \
-of practical advice specific to this beat, not generic journalism advice) \
-and a **Calendar & Recurring Events** section, where a list is appropriate \
-because the items are genuinely list-shaped (a meeting on the second \
-Tuesday of every month).
+3. After receiving the answers, immediately call generate_beat_book \
+with:
+   - filename: kebab-case .md filename
+   - beat_selection: the topic labels they checked (exact spelling \
+from the briefings)
+   - focus_notes: 2-4 sentences of emphasis instructions for the \
+writer, distilled from the answers. Be concrete: name topics, \
+audiences, and angles. The writer reads these notes and the \
+briefings — nothing else from this conversation.
 
-**Writing style.** Write in connected prose, the way a senior reporter would \
-brief a colleague picking up the beat — not as an outline. Use bullets only \
-for genuinely list-shaped content: a roster of named sources, a short list \
-of story ideas, a calendar. Do NOT create per-topic sub-headers like \
-"What's happening / Key story / Story angles" — let the prose carry the \
-structure. Write complete sentences with concrete subjects and verbs ("The \
-school board voted 6-1 last March to raise property taxes" — not "School \
-board: 6-1 vote, March, property tax increase"). Reference actual stories, \
-names, and details from the corpus, not generic advice. The result should \
-read like a piece of journalism about the beat, useful enough that a \
-brand-new reporter could pick it up and start producing informed coverage \
-the same day.
+The writer will produce the final prose. Do NOT try to write the \
+beat book yourself — your generate_beat_book call kicks off a \
+separate Sonnet pass that handles the writing.
 
-**Do NOT include a table of contents.** The viewer provides its own \
-navigation from the document's headings, so a TOC in the Markdown is \
-redundant. Start the document with the title and subtitle, then go directly \
-into the Beat Overview.
+Optional verification tools (use only if a briefing seems to be \
+missing or wrong about something):
+- view_topics  — compact recap of topic labels and counts
+- list_stories_in_topic(topic) — story index/title/date for a topic
+- read_story(index) — the full text of one story
+- search_stories(query) — keyword search across all stories
 
-Keep your conversational messages concise. Use tools frequently.\
+You have a 10-turn budget. Most sessions finish in 3-5 turns; \
+spending turns on verification is fine but not required.
+
+Keep any narration short. Use tools.
 """
 
+_BRIEFINGS_HEADER = "\n# Topic landscape\n\n"
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_system_blocks(pipeline_result: PipelineResult) -> list[dict]:
+    """Return the `system` value as a list of text blocks. The briefings
+    block is marked cache_control: ephemeral so subsequent turns reuse it
+    instead of re-encoding the full corpus knowledge."""
+    briefings_md = render_briefings_markdown(pipeline_result.briefings or {})
+    # Build a compact list of broad-topic labels with story counts to anchor
+    # the checklist question.
+    label_lines: list[str] = []
+    for label, indices in sorted(
+        pipeline_result.broad_topics.items(), key=lambda x: -len(x[1])
+    ):
+        label_lines.append(f"- {label} ({len(indices)} stories)")
+    label_block = "## Broad topic labels (use these exactly in the checklist)\n\n" + "\n".join(label_lines)
+
+    return [
+        {"type": "text", "text": _SYSTEM_PREFIX},
+        {
+            "type": "text",
+            "text": _BRIEFINGS_HEADER + label_block + "\n\n" + briefings_md,
+            "cache_control": {"type": "ephemeral"},
+        },
+    ]
+
+
+# ────────────────────────────────────────────────────────────────────────
 # LOCAL TOOL EXECUTION
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _target_for_topic(topic_size: int) -> int:
-    """Per-topic minimum read count: every story if the topic has fewer than
-    15, otherwise half (rounded up)."""
-    if topic_size < 15:
-        return topic_size
-    return (topic_size + 1) // 2
-
-
-def _progress_report(
-    pipeline_result: PipelineResult,
-    listed_topics: set,
-    read_indices: set,
-) -> tuple[str, bool]:
-    """Format the agent's research progress, plus a boolean telling whether
-    every listed topic has reached its read-count target. The boolean drives
-    the generate_beat_book gate."""
-    if not listed_topics:
-        return (
-            "[Research progress] No topics listed yet. Call list_stories_in_topic "
-            "for each topic the reporter selected to start exploring.",
-            False,
-        )
-
-    lines = ["[Research progress]"]
-    all_met = True
-    for topic in sorted(listed_topics):
-        indices = pipeline_result.topics.get(topic, [])
-        if not indices:
-            continue
-        total = len(indices)
-        read = sum(1 for i in indices if i in read_indices)
-        target = _target_for_topic(total)
-        met = read >= target
-        if not met:
-            all_met = False
-        marker = "OK" if met else "needs more"
-        lines.append(
-            f"  - {topic}: {read}/{total} read (target {target}) — {marker}"
-        )
-    lines.append(
-        f"Total stories read (unique): {len(read_indices)}. "
-        "Targets: every story in topics with <15 stories, otherwise half."
-    )
-    if not all_met:
-        lines.append(
-            "generate_beat_book will be rejected until every listed topic "
-            "meets its target. Keep reading."
-        )
-    return "\n".join(lines), all_met
-
+# ────────────────────────────────────────────────────────────────────────
 
 def execute_local_tool(name: str, input_data: dict, result: PipelineResult) -> str:
     """Execute a non-interactive tool and return a string result."""
@@ -324,120 +283,224 @@ def execute_local_tool(name: str, input_data: dict, result: PipelineResult) -> s
         return result.topic_summary()
 
     if name == "list_stories_in_topic":
-        stories = result.stories_for_topic(input_data["topic"])
+        stories = result.stories_for_topic(input_data.get("topic", ""))
         if not stories:
-            return f"No stories found for topic '{input_data['topic']}'. Check exact spelling."
+            return f"No stories found for topic {input_data.get('topic', '')!r}. Check exact spelling."
         return json.dumps(stories, indent=2)
 
     if name == "read_story":
-        story = result.get_story(input_data["index"])
+        idx = input_data.get("index")
+        story = result.get_story(idx) if isinstance(idx, int) else None
         if not story:
-            return f"Invalid index {input_data['index']}. Valid range: 0–{len(result.stories)-1}."
+            return f"Invalid index {idx}. Valid range: 0-{len(result.stories) - 1}."
+        # Strip direct quotes from the preview the agent sees — it gives a
+        # tighter 3000-char window of actual reportorial prose. The original
+        # content is still available to the citation matcher elsewhere.
         return json.dumps({
-            "index": input_data["index"],
-            "title": story.get("title", ""),
-            "author": story.get("author", ""),
-            "date": story.get("date", ""),
-            "topics": result.story_topics[input_data["index"]],
-            "content": story.get("content", "")[:3000],
+            "index":   idx,
+            "title":   story.get("title", ""),
+            "author":  story.get("author", ""),
+            "date":    story.get("date", ""),
+            "topics":  result.story_topics[idx],
+            "content": strip_quotes(story.get("content", ""))[:3000],
         }, indent=2)
 
     if name == "search_stories":
-        matches = result.search_stories(input_data["query"])
+        matches = result.search_stories(input_data.get("query", ""))
         if not matches:
-            return f"No stories matching '{input_data['query']}'."
+            return f"No stories matching {input_data.get('query', '')!r}."
         return json.dumps(matches, indent=2)
 
     return f"Unknown tool: {name}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# FINAL DRAFT (Sonnet 4.6 prose synthesis)
+# ────────────────────────────────────────────────────────────────────────
+
+_WRITER_SYSTEM = """\
+You are writing a beat book — a long-form reporting guide a journalist \
+will use to cover a specific beat. The reporter has uploaded a news \
+corpus; an upstream pipeline produced a structured briefing per topic. \
+You will receive those briefings, the reporter's interview answers, \
+and a short focus note from the planning agent.
+
+Write the beat book as flowing prose in Markdown. Structure:
+
+- Open with a title (`#`) and a one-line subtitle, then a 2-3 paragraph \
+**Beat Overview** explaining what the beat covers and why it matters.
+- **Key Topics & Themes** — organize around the topics in beat_selection. \
+For each, write a few paragraphs describing who is doing what, what is \
+at stake, and the recurring arc in the coverage. Reference real names, \
+real organizations, real dates from the briefings.
+- **Key Sources & Players** — write about the recurring people and \
+organizations in connected sentences; do not reduce them to a \
+bulleted roster.
+- **Story Ideas & Angles** — a short numbered list, introduced by a \
+sentence or two framing the gap each idea addresses.
+- **Background & Context** — flowing prose of history, policy, \
+institutional knowledge a new reporter would need.
+- **Reporting Tips** — a few sentences of practical advice specific \
+to this beat. Not generic journalism advice.
+- **Calendar & Recurring Events** — a list IS appropriate here \
+because items are genuinely list-shaped (meetings, deadlines).
+
+Writing rules:
+- Connected prose, not outlines. Use bullets only for genuinely \
+list-shaped content (named sources, story ideas, calendar).
+- Reference actual names, dates, and details from the briefings. \
+Do not invent facts.
+- Do NOT include a table of contents. The viewer renders its own.
+- Do NOT add per-topic sub-headers like \"What's happening / Key \
+story / Story angles\" — let prose carry the structure.
+
+Use the focus_notes to calibrate emphasis. If the reporter said they \
+want X, lead with X.
+"""
+
+
+def _format_interview_block(interview_log: list[dict]) -> str:
+    if not interview_log:
+        return "(The reporter did not answer any interview questions.)"
+
+    parts: list[str] = []
+    for round_idx, item in enumerate(interview_log, 1):
+        if item.get("intro"):
+            parts.append(f"**Round {round_idx} intro:** {item['intro']}")
+        for a in item.get("answers") or []:
+            q = (a.get("question") or "").strip()
+            ans = a.get("answer", "")
+            if isinstance(ans, list):
+                ans = ", ".join(str(x) for x in ans) if ans else "(no answer)"
+            ans = str(ans).strip() or "(no answer)"
+            parts.append(f"- Q: {q}\n  A: {ans}")
+    return "\n".join(parts)
+
+
+async def _generate_final_beat_book(
+    client,
+    pipeline_result: PipelineResult,
+    beat_selection: list[str],
+    focus_notes: str,
+    interview_log: list[dict],
+) -> str:
+    """Single Sonnet 4.6 call that writes the final Markdown.
+
+    The briefings sit on the user side (not system) because they're
+    session-specific; the static writing rules live in the system prompt.
+    """
+    briefings_md = render_briefings_markdown(pipeline_result.briefings or {})
+    interview_md = _format_interview_block(interview_log)
+    selection_md = ", ".join(beat_selection) if beat_selection else "(no specific selection — cover the whole corpus)"
+
+    user_msg = (
+        "# Beat scope\n\n"
+        f"The reporter has identified their beat as: **{selection_md}**.\n\n"
+        "# Focus notes from the planning agent\n\n"
+        f"{focus_notes or '(none)'}\n\n"
+        "# Reporter's interview answers\n\n"
+        f"{interview_md}\n\n"
+        "# Topic briefings (full corpus knowledge)\n\n"
+        f"{briefings_md}\n\n"
+        "Now write the complete beat book in flowing Markdown. Begin with "
+        "the title and a one-line subtitle, then dive into the Beat Overview."
+    )
+
+    response = await asyncio.to_thread(
+        client.messages.create,
+        model=WRITER_MODEL,
+        max_tokens=DRAFT_MAX_TOKENS,
+        system=[
+            {
+                "type": "text",
+                "text": _WRITER_SYSTEM,
+                "cache_control": {"type": "ephemeral"},
+            },
+        ],
+        messages=[{"role": "user", "content": user_msg}],
+        thinking=thinking_param(),
+    )
+    return "".join(
+        b.text for b in response.content
+        if getattr(b, "type", None) == "text"
+    ).strip()
+
+
+# ────────────────────────────────────────────────────────────────────────
 # AGENT LOOP
-# ─────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 
-# Type for the callback that sends questions to the frontend and gets answers
-InterviewCallback = Callable[[dict], Awaitable[str]]
-# Type for the callback that sends agent text messages to the frontend
-MessageCallback   = Callable[[str], Awaitable[None]]
-# Type for the callback that reports tool execution status
+InterviewCallback  = Callable[[dict], Awaitable[str]]
+MessageCallback    = Callable[[str], Awaitable[None]]
 ToolStatusCallback = Callable[[str, str, str], Awaitable[None]]
+BeatBookCallback   = Callable[[str, str], Awaitable[None]]
 
 
-# Human-friendly descriptions for each tool
 TOOL_DESCRIPTIONS = {
-    "view_topics": "Reviewing discovered topics",
+    "view_topics":          "Reviewing discovered topics",
     "list_stories_in_topic": "Listing stories in topic",
-    "read_story": "Reading a story",
-    "search_stories": "Searching stories",
-    "interview_user": "Asking you a question",
-    "generate_beat_book": "Writing the beat book",
+    "read_story":           "Reading a story",
+    "search_stories":       "Searching stories",
+    "interview_user":       "Asking you a question",
+    "generate_beat_book":   "Writing the beat book",
 }
 
 
 async def run_agent(
     pipeline_result: PipelineResult,
     anthropic_key: str,
+    interview_log: list[dict],
     on_interview: InterviewCallback,
     on_message: MessageCallback,
-    on_beat_book: Callable[[str, str], Awaitable[None]],
-    on_tool_status: ToolStatusCallback = None,
+    on_beat_book: BeatBookCallback,
+    on_tool_status: Optional[ToolStatusCallback] = None,
 ) -> None:
-    """
-    Run the agent loop.
+    """Run the planning loop, then synthesize the final draft via Sonnet.
 
     Args:
-        pipeline_result: Output from the embedding/clustering pipeline.
-        anthropic_key: Anthropic API key (claude-sonnet-4-6).
-        on_interview: async callback(question_data) → user's answer string.
-        on_message: async callback(text) — sends agent text to the frontend.
-        on_beat_book: async callback(filename, markdown) — saves/delivers the beat book.
-        on_tool_status: async callback(tool_name, detail) — reports tool execution status.
+        pipeline_result: PipelineResult (must include .briefings).
+        anthropic_key: Anthropic API key.
+        interview_log: session-scoped list — the on_interview callback in
+            app.py appends one entry per round (intro / questions / answers).
+            The writer call reads this list to render the reporter's answers
+            into the prompt.
+        on_interview: async callback(question_data) -> user's answer string.
+        on_message: async callback(text) — agent narration to the frontend.
+        on_beat_book: async callback(filename, markdown) — final delivery.
+        on_tool_status: async callback(tool_name, desc, detail) — status pings.
     """
     client = chat_client(anthropic_key)
 
     n_stories = len(pipeline_result.stories)
-    n_topics  = len(pipeline_result.topics)
+    n_topics  = len(pipeline_result.broad_topics)
 
-    # Anthropic conversation: `system` is a top-level kwarg, not a message.
+    system_blocks = _build_system_blocks(pipeline_result)
+
     messages: list[dict] = [
         {
             "role": "user",
             "content": (
-                f"I've uploaded {n_stories} news stories. The system has automatically "
-                f"discovered {n_topics} topics across them. Please help me build a "
-                "beat book from these stories. Start by exploring the topics, then "
-                "interview me to understand my beat."
+                f"{n_stories} stories across {n_topics} broad topics have "
+                "been uploaded and analyzed. The topic briefings are in your "
+                "system prompt. Please run the brief interview now, then "
+                "trigger the beat book."
             ),
         },
     ]
 
     last_message_text = ""
     beat_book_done = False
-
-    # Research-progress tracking. listed_topics is the set of topic labels the
-    # agent has called list_stories_in_topic on (a proxy for "topics the
-    # reporter selected"); read_indices is the set of story indices the
-    # agent has read via read_story. Both feed _progress_report, which is
-    # surfaced in every local tool result AND used to gate generate_beat_book.
-    listed_topics: set = set()
-    read_indices: set = set()
-
     thinking_cfg = thinking_param()
 
-    MAX_TURNS = 40
-    for _turn in range(MAX_TURNS):
-        # SDK blocks the event loop; offload to a worker thread so the
-        # WebSocket handler stays responsive. If the SDK exhausts its own
-        # 429-retry budget, the outer loop here pauses and tries again
-        # before tearing down the session.
+    for turn in range(MAX_TURNS):
         response = None
         for rl_attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
             try:
                 response = await asyncio.to_thread(
                     client.messages.create,
                     model=AGENT_MODEL,
-                    max_tokens=MAX_TOKENS_PER_TURN,
-                    system=SYSTEM_PROMPT,
+                    max_tokens=LOOP_MAX_TOKENS,
+                    system=system_blocks,
                     tools=TOOLS,
                     messages=messages,
                     thinking=thinking_cfg,
@@ -446,20 +509,19 @@ async def run_agent(
             except anthropic.RateLimitError:
                 if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
                     await on_message(
-                        "⚠️ Anthropic's concurrent-connection rate limit "
-                        "is persistently exceeded — please wait a few "
-                        "minutes and start a new session."
+                        "Anthropic's concurrent-connection rate limit is "
+                        "persistently exceeded — please wait a minute and "
+                        "start a new session."
                     )
                     return
                 await on_message(
-                    f"⏸ Hit Anthropic's concurrent-connection rate limit. "
-                    f"Waiting {RATE_LIMIT_PAUSE_SECONDS}s before retrying "
-                    f"(attempt {rl_attempt + 1}/{RATE_LIMIT_MAX_RETRIES})…"
+                    f"Hit Anthropic's concurrent-connection rate limit. "
+                    f"Waiting {RATE_LIMIT_PAUSE_SECONDS}s and retrying "
+                    f"({rl_attempt + 1}/{RATE_LIMIT_MAX_RETRIES})..."
                 )
                 await asyncio.sleep(RATE_LIMIT_PAUSE_SECONDS)
-        assert response is not None  # loop above either sets or returns
+        assert response is not None
 
-        # Forward any plain-text narration to the frontend (dedup repeats).
         text_combined = "".join(
             b.text for b in response.content
             if getattr(b, "type", None) == "text"
@@ -470,20 +532,17 @@ async def run_agent(
 
         stop_reason = response.stop_reason
 
-        # No tool use this turn = end of conversation, or we already wrote
-        # the beat book on the prior turn.
         if stop_reason != "tool_use":
             if stop_reason == "max_tokens":
                 await on_message(
-                    "⚠️ The model hit its output limit mid-turn. The beat book "
-                    "may be incomplete. Please try again with a tighter scope."
+                    "The model hit its output limit mid-turn. The beat "
+                    "book may be incomplete. Please try again."
                 )
             break
         if beat_book_done:
             break
 
-        # Preserve the full assistant content (text + thinking + tool_use)
-        # verbatim so the next request stays coherent.
+        # Preserve assistant content verbatim (text + thinking + tool_use).
         messages.append({"role": "assistant", "content": response.content})
 
         tool_results: list[dict] = []
@@ -491,75 +550,71 @@ async def run_agent(
             if getattr(block, "type", None) != "tool_use":
                 continue
 
-            tool_name = block.name
-            tool_id = block.id
+            tool_name  = block.name
+            tool_id    = block.id
             tool_input = block.input or {}
 
-            # Report tool status to the frontend
             if on_tool_status:
                 desc = TOOL_DESCRIPTIONS.get(tool_name, tool_name)
                 detail = ""
                 if tool_name == "list_stories_in_topic":
                     detail = tool_input.get("topic", "")
                 elif tool_name == "read_story":
-                    idx = tool_input.get("index", "")
+                    idx = tool_input.get("index")
                     story = pipeline_result.get_story(idx) if isinstance(idx, int) else None
-                    detail = story.get("title", f"#{idx}")[:60] if story else f"#{idx}"
+                    detail = (story.get("title", f"#{idx}")[:60] if story else f"#{idx}")
                 elif tool_name == "search_stories":
                     detail = tool_input.get("query", "")
                 await on_tool_status(tool_name, desc, detail)
 
             if tool_name == "interview_user":
+                # app.py's on_interview appends to the shared interview_log
+                # before returning the human-readable answer string.
                 answer = await on_interview(tool_input)
                 content_str = f"Reporter's answer: {answer}"
 
             elif tool_name == "generate_beat_book":
-                progress, threshold_met = _progress_report(
-                    pipeline_result, listed_topics, read_indices,
-                )
-                if not threshold_met:
+                # No more gating: trigger the Sonnet writer pass immediately.
+                filename = (tool_input.get("filename") or "beat_book.md").strip()
+                if not filename.endswith(".md"):
+                    filename = filename + ".md"
+                beat_selection = tool_input.get("beat_selection") or []
+                focus_notes    = tool_input.get("focus_notes") or ""
+
+                await on_message("Handing off to the writer model...")
+                try:
+                    markdown = await _generate_final_beat_book(
+                        client, pipeline_result,
+                        beat_selection, focus_notes,
+                        interview_log,
+                    )
+                except Exception as e:
                     content_str = (
-                        "generate_beat_book REJECTED — research is incomplete.\n\n"
-                        f"{progress}\n\n"
-                        "Continue using list_stories_in_topic (for any topics you "
-                        "haven't listed yet) and read_story to bring every listed "
-                        "topic up to its target, then call generate_beat_book again. "
-                        "Do not stop — the user will get no beat book if you abandon "
-                        "the loop now."
+                        f"Writer model failed: {type(e).__name__}: {e}. "
+                        "Try generate_beat_book again."
                     )
                 else:
-                    await on_beat_book(
-                        tool_input.get("filename", "beat_book.md"),
-                        tool_input.get("markdown_content", ""),
-                    )
-                    content_str = "Beat book saved successfully. You may now give a brief closing message."
-                    beat_book_done = True
+                    if not markdown:
+                        content_str = (
+                            "Writer model returned an empty document. Try "
+                            "generate_beat_book again with clearer focus_notes."
+                        )
+                    else:
+                        await on_beat_book(filename, markdown)
+                        content_str = "Beat book saved successfully. You may give a brief closing message."
+                        beat_book_done = True
 
             else:
                 content_str = execute_local_tool(tool_name, tool_input, pipeline_result)
-                # Track research progress and append a status block so the
-                # model can self-check against the per-topic targets.
-                if tool_name == "list_stories_in_topic":
-                    topic = tool_input.get("topic", "")
-                    if topic and topic in pipeline_result.topics:
-                        listed_topics.add(topic)
-                elif tool_name == "read_story":
-                    idx = tool_input.get("index")
-                    if isinstance(idx, int) and 0 <= idx < len(pipeline_result.stories):
-                        read_indices.add(idx)
-                progress, _ = _progress_report(
-                    pipeline_result, listed_topics, read_indices,
-                )
-                content_str = f"{content_str}\n\n{progress}"
 
             tool_results.append({
-                "type": "tool_result",
+                "type":        "tool_result",
                 "tool_use_id": tool_id,
-                "content": content_str,
+                "content":     content_str,
             })
 
         if tool_results:
             messages.append({"role": "user", "content": tool_results})
 
     if not beat_book_done:
-        await on_message("✅ Agent session complete.")
+        await on_message("Agent session ended without saving a beat book.")

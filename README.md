@@ -6,8 +6,28 @@ Originally built around [Chicago Public Media](https://chicago.suntimes.com/) st
 
 ---
 
+## Changelog
+
+### 2026-05-13 — Speed pass (1–3 min target)
+
+End-to-end beat book generation is now pipelined for ~1–3 minutes regardless of corpus size, with the Opus 4.7 web-research stage moved to an opt-in step.
+
+- **Models.** Haiku 4.5 (`claude-haiku-4-5-20251001`) drives ingest normalization, cluster labeling, per-topic briefings, and the agent's tool-use loop. Sonnet 4.6 (`claude-sonnet-4-6`) is reserved for the final beat-book prose synthesis.
+- **Ingest.** Per-file concurrency raised from 1 → 10 (`app.py`); per-chunk concurrency raised from 1 → 8 (`ingest.py`); the 2-second inter-chunk pause is gone; chunk window enlarged from 100 KB to 160 KB.
+- **Pipeline.** Cluster labeling is one batched LLM call per granularity tier (broad / specific) instead of one call per cluster. A new step builds structured per-topic briefings — key people, orgs, dates, recurring themes, representative excerpts, open questions — in parallel across topics.
+- **Agent.** The "must read half the stories" research gate is removed (`_target_for_topic` / `_progress_report` are gone). Briefings are injected into the system prompt with `cache_control: ephemeral` so subsequent turns reuse them. The agent now plans the interview + beat selection only; a single Sonnet 4.6 call writes the final Markdown from the briefings + interview answers.
+- **Citations.** `citation_matcher.py` is fully vectorized — source-sentence embeddings stack into one L2-normalized matrix, beat-book sentences into another, and a single `B @ S.T` matmul replaces the per-sentence Python loop.
+- **Web research.** The Opus 4.7 `research_agent` stage is opt-in. The default WebSocket flow ends after the first draft + citations; a "Deepen with web research" button on the done screen triggers it over the same socket via `{"action": "research"}`.
+- **Quote stripping.** A regex-based `strip_quotes` helper removes direct-quotation sentences (`"…," said X.` / `"…," X said.`, smart quotes and honorifics like `Dr.` / `U.S. Sen.` handled) from LLM-feed contexts only — embedding input, cluster-label sampling, briefing prompts, `read_story` previews. Citation matching still reads the original unstripped content, so paraphrase-to-source lookups continue to resolve. Typical reduction on news prose: ~25% of the word budget.
+- **Rate-limit retries.** Tightened from 16 × 60s (16 min total) to 8 × 10s (~80s total) so a single stuck request can't blow the full pipeline budget.
+
+> Doc sections below describe the original architecture and have not yet been updated for these changes; the changelog above supersedes them where they conflict.
+
+---
+
 ## Table of Contents
 
+- [Changelog](#changelog)
 - [How It Works](#how-it-works)
 - [Architecture Overview](#architecture-overview)
 - [Ingest: Files, URLs, and the Preview Screen](#ingest-files-urls-and-the-preview-screen)

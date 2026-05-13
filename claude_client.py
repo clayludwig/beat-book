@@ -1,10 +1,17 @@
 """
 claude_client.py
 ----------------
-Shared Anthropic configuration for the chat-model slots (ingest
-normalization, cluster labeling, the interview agent). Anthropic has no
-embedding API, so embeddings continue to use OpenAI's — that client is
-constructed at the call sites that need it.
+Shared Anthropic configuration for the chat-model slots.
+
+Two model tiers:
+- CHAT_MODEL  (Haiku 4.5) — ingest normalization, cluster labeling,
+  topic briefings, the agent's tool-use loop. Low latency for the
+  structurally simple jobs.
+- DRAFT_MODEL (Sonnet 4.6) — final beat-book synthesis only. Higher
+  prose quality where it actually shows in the output.
+
+Anthropic has no embedding API, so embeddings continue to use OpenAI's —
+that client is constructed at the call sites that need it.
 
 Env vars:
 - ANTHROPIC_API_KEY (required)
@@ -13,12 +20,13 @@ Env vars:
 import os
 from anthropic import Anthropic
 
-CHAT_MODEL = "claude-sonnet-4-6"
+CHAT_MODEL = "claude-haiku-4-5-20251001"
+DRAFT_MODEL = "claude-sonnet-4-6"
 
 
 # Per-request timeout for the Anthropic client. The SDK default is 10
-# minutes; 180s keeps real failures visible to the user inside ~3 minutes
-# while leaving headroom for long tool-use turns.
+# minutes; 180s keeps real failures visible inside ~3 minutes while
+# leaving headroom for long tool-use turns.
 CHAT_TIMEOUT_SECONDS = 180.0
 
 # SDK retries are off so each 429 surfaces immediately at the call site
@@ -28,9 +36,11 @@ CHAT_TIMEOUT_SECONDS = 180.0
 CHAT_MAX_RETRIES = 0
 
 # Explicit retry policy used by call sites when they catch RateLimitError.
-# 16 attempts × 60s ≈ 16 minutes of patient waiting before giving up.
-RATE_LIMIT_MAX_RETRIES = 16
-RATE_LIMIT_PAUSE_SECONDS = 60
+# Tuned for the 1–3 min total pipeline budget: 8 × 10s ≈ 80s of patience
+# is more than enough to ride out brief concurrent-limit spikes without
+# blowing the whole budget on one stuck request.
+RATE_LIMIT_MAX_RETRIES = 8
+RATE_LIMIT_PAUSE_SECONDS = 10
 
 
 def chat_client(api_key: str | None = None) -> Anthropic:
