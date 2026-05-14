@@ -63,7 +63,7 @@ sessions: Dict[str, PipelineResult] = {}
 @dataclass
 class IngestJob:
     job_id: str
-    queue: queue.Queue = field(default_factory=queue.Queue)
+    msg_queue: queue.Queue = field(default_factory=queue.Queue)
     done: bool = False
     result: Optional[dict] = None
     error: str = ""
@@ -113,14 +113,14 @@ async def _run_ingest_job(
     semaphore = asyncio.Semaphore(_INGEST_CONCURRENCY)
     total_sources = len(buffered_files) + len(url_list)
 
-    job.queue.put({"type": "job_started", "total_sources": total_sources})
+    job.msg_queue.put({"type": "job_started", "total_sources": total_sources})
 
     async def run_file(name: str, raw: bytes):
         async with semaphore:
-            job.queue.put({"type": "source_started", "source_label": name})
+            job.msg_queue.put({"type": "source_started", "source_label": name})
 
             def on_progress(payload: dict):
-                job.queue.put({
+                job.msg_queue.put({
                     "type": "source_progress",
                     "source_label": name,
                     **payload,
@@ -135,7 +135,7 @@ async def _run_ingest_job(
                     on_progress=on_progress,
                 ),
             )
-            job.queue.put({
+            job.msg_queue.put({
                 "type": "source_done",
                 "source_label": name,
                 "num_entries": len(result.stories),
@@ -145,10 +145,10 @@ async def _run_ingest_job(
 
     async def run_url(url: str):
         async with semaphore:
-            job.queue.put({"type": "source_started", "source_label": url})
+            job.msg_queue.put({"type": "source_started", "source_label": url})
 
             def on_progress(payload: dict):
-                job.queue.put({
+                job.msg_queue.put({
                     "type": "source_progress",
                     "source_label": url,
                     **payload,
@@ -162,7 +162,7 @@ async def _run_ingest_job(
                     on_progress=on_progress,
                 ),
             )
-            job.queue.put({
+            job.msg_queue.put({
                 "type": "source_done",
                 "source_label": url,
                 "num_entries": len(result.stories),
@@ -179,7 +179,7 @@ async def _run_ingest_job(
         import traceback
         traceback.print_exc()
         job.error = f"Ingestion failed: {type(e).__name__}: {e}"
-        job.queue.put({"type": "error", "error": job.error})
+        job.msg_queue.put({"type": "error", "error": job.error})
         job.done = True
         return
 
@@ -190,7 +190,7 @@ async def _run_ingest_job(
         "total_stories": total_stories,
         "total_sources": len(results),
     }
-    job.queue.put({"type": "done", **job.result})
+    job.msg_queue.put({"type": "done", **job.result})
     job.done = True
 
 
@@ -241,9 +241,9 @@ async def ingest_stream(job_id: str):
         return JSONResponse({"error": "Invalid ingest job."}, status_code=404)
 
     async def event_stream():
-        while not job.done or not job.queue.empty():
+        while not job.done or not job.msg_queue.empty():
             try:
-                msg = job.queue.get_nowait()
+                msg = job.msg_queue.get_nowait()
                 yield f"data: {json.dumps(msg)}\n\n"
             except queue.Empty:
                 await asyncio.sleep(0.1)
