@@ -641,7 +641,7 @@
           break;
 
         case "beat_book_markdown_saved":
-          setGenerating("Matching citations", "Embedding source sentences…");
+          setGenerating("Matching citations", "Embedding source passages…");
           setStage("cite");
           setShimmerDeterminate(0.02);
           break;

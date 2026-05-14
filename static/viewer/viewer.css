@@ -382,17 +382,177 @@ body {
     margin: 2rem 0;
 }
 
-.sourced-content {
-    color: #666;
-    cursor: pointer;
+/* Inline footnote reference rendered as a small blue chip with a subtle
+   rounded-rectangle frame. Uniform color — no per-citation variance, no
+   score. The blue hue is shared with the source-passage highlight so the
+   chip and the highlight visibly belong to the same color family.
+   ALL font/text properties are set explicitly so the chip never inherits
+   bold / italic / colored / underlined / size styling from the surrounding
+   prose. font-size is rem (not em) so it doesn't scale with the parent. */
+.footnote-ref {
+    display: inline-block;
+    margin: 0 0.15rem;
+    padding: 0.05rem 0.4rem;
+    background: #e6f0fb;
+    border: 1px solid #b8d4f0;
+    border-radius: 4px;
+
+    /* explicit text styling — do not inherit from surrounding prose */
+    color: #1c5fb8;
+    font-family: inherit;
+    font-size: 0.78rem;
+    font-style: normal;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: normal;
+    line-height: 1.3;
     text-decoration: none;
-    border-bottom: 1px dotted #888;
-    padding-bottom: 1px;
+    text-transform: none;
+
+    cursor: pointer;
+    vertical-align: baseline;
+    position: relative;
+    top: -0.2rem;
+}
+.footnote-ref:hover {
+    background: #d3e3f5;
+    border-color: #8fb8e2;
+    color: #0d4d9c;
+    text-decoration: none;
 }
 
-.sourced-content:hover {
+/* Footnotes section appended to the document body */
+.footnotes {
+    margin-top: 4rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid #e0e0e0;
+}
+.footnotes-heading {
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: #555;
+    margin: 0 0 1rem;
+    letter-spacing: 0.02em;
+}
+.footnotes-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    counter-reset: footnote;
+}
+.footnote-item {
+    margin: 0 0 1.25rem;
+    font-size: 0.92rem;
+    line-height: 1.5;
+    color: #444;
+}
+.footnote-numbers {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    margin-right: 0.5rem;
+    vertical-align: 0.05rem;
+}
+/* The leading number-list chips inside the footnote — same blue-chip
+   styling as the inline footnote refs so the visual rhyme is obvious.
+   All text props locked so the chip never inherits surrounding styling. */
+.footnote-number {
+    display: inline-block;
+    min-width: 1.2rem;
+    text-align: center;
+    padding: 0.05rem 0.45rem;
+    background: #e6f0fb;
+    border: 1px solid #b8d4f0;
+    border-radius: 4px;
+
+    color: #1c5fb8;
+    font-family: inherit;
+    font-size: 0.78rem;
+    font-style: normal;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: normal;
+    line-height: 1.3;
+    text-decoration: none;
+    text-transform: none;
+
+    cursor: pointer;
+}
+.footnote-number:hover {
+    background: #d3e3f5;
+    border-color: #8fb8e2;
+    color: #0d4d9c;
+    text-decoration: none;
+}
+.footnote-link {
+    color: #333;
+    text-decoration: underline;
+    text-decoration-color: #ccc;
+    text-underline-offset: 2px;
+    cursor: pointer;
+    font-weight: 500;
+}
+.footnote-link:hover {
     color: #0066cc;
-    border-bottom-color: #0066cc;
+    text-decoration-color: #0066cc;
+}
+.footnote-meta {
+    color: #888;
+}
+.footnote-passage {
+    margin: 0.4rem 0 0;
+    padding: 0.4rem 0.75rem;
+    border-left: 2px solid #e0e0e0;
+    color: #666;
+    font-size: 0.88rem;
+    font-style: italic;
+    background: #fafafa;
+    border-radius: 0 3px 3px 0;
+}
+
+/* Source-article highlight: single shade on the matched passage, in the
+   same blue hue as the inline footnote chip. */
+.article-body {
+    white-space: normal;
+    line-height: 1.7;
+}
+.article-body mark,
+mark.passage-match {
+    background: rgba(28, 95, 184, 0.16);
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
+}
+
+/* "Cited for" card at the top of the article panel — gives the highlighted
+   passage in the source a visible counterpart from the beat book. */
+.cited-claim-card {
+    margin: 0.75rem 0 1.25rem;
+    padding: 0.85rem 1rem;
+    background: #f3f8fd;
+    border: 1px solid #d1e2f5;
+    border-left: 3px solid #1c5fb8;
+    border-radius: 6px;
+}
+.cited-claim-label {
+    display: block;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #1c5fb8;
+    margin-bottom: 0.35rem;
+}
+.cited-claim-text {
+    font-size: 0.95rem;
+    line-height: 1.5;
+    color: #2a2a2a;
+    font-style: italic;
+}
+.cited-claim-arrow {
+    margin-top: 0.45rem;
+    font-size: 0.72rem;
+    color: #999;
 }
 
 /* Hover preview tooltip */

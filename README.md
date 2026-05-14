@@ -6,6 +6,66 @@ Originally built around [Chicago Public Media](https://chicago.suntimes.com/) st
 
 ---
 
+## Changelog
+
+### 2026-05-13 — Improved citations
+
+Rewrote `citation_matcher.py` and `static/viewer/` end-to-end. The
+matcher now matches paragraph-level passages, retrieves top-K above a
+per-corpus calibrated similarity threshold, and surfaces results to the
+viewer as academic-style numbered footnotes.
+
+- **Source side: passage chunks, not sentences.** Each story is sliced
+  into 100-word sliding windows with 16-word overlap; each window keeps
+  its character offset back into the source so the viewer can resolve a
+  hit to a quoted span.
+- **NumPy vectorization** for the cosine matmul (L2-normalize +
+  `B @ S.T`, replacing the per-sentence Python loop).
+- **Per-corpus threshold calibration.** Random `(beat_sentence,
+  source_passage)` pairs are sampled to estimate the noise floor; the
+  cutoff is `noise_mean + 3·sigma`, clamped to an absolute floor of
+  0.40. Calibration is written into the output JSON and is internal —
+  the viewer never surfaces the numbers.
+- **Top-K retrieval** (`K=5`) per beat-book sentence; everything below
+  threshold is dropped instead of confidently mis-attributed.
+- **Context-sum query embeddings** (`0.6·prev + 1.0·self + 0.4·next`,
+  paragraph-bounded) so pronoun-heavy / short sentences attribute
+  correctly.
+- **Leave-one-out sub-window highlighting** is computed in a single
+  pooled parallel batch (was N supports × 6 sub-windows × sequential
+  embedding calls — now one batched parallel `_embed_many` call).
+- **Parallelized embedding batches** (6× `ThreadPoolExecutor`, order-
+  preserving). Total wall-clock for citation matching is under ~5s for
+  any corpus we'd realistically run, dominated by network round-trip
+  rather than local computation.
+- **Viewer: academic footnotes.** Inline citations are uniformly-blue
+  `[N]` chip markers (rounded rectangle, 4px radius, no per-similarity
+  color variance, no score visible to the reader). Numbers are assigned
+  in document order — the first chip on the page is `[1]`, next is
+  `[2]`, etc.
+- **Footnotes section at the bottom** of the document, one entry per
+  unique source. Each entry lists *every* inline number that points to
+  that source as clickable chips, plus the article title / author /
+  date and the matched passage as a quote.
+- **Run-dedup of consecutive same-source citations** — a stretch of
+  sentences all citing the same passage collapses to one chip on the
+  last sentence in the run. Blank lines do NOT break the run; headings
+  / lists / plain prose do.
+- **Source-passage highlight in the same blue hue** as the chip, so
+  the chain (inline chip → opened-article highlight → claim card
+  accent) reads as one color family.
+- **Highlight tidying** — the matched passage range snaps to whole
+  paragraphs when the window covers ≥50%, drops slivers, and filters
+  nav-chrome paragraphs (`Related` / `Read more` / `See also` labels
+  and the headlines that follow them).
+- **Chip styles locked** — `font-weight`, `font-style`, `text-
+  decoration`, `color`, `text-transform`, and `font-size` are all
+  explicit (and `font-size` is `rem`, not `em`) so the chip never
+  inherits surrounding bold / italic / colored / underlined / scaled
+  text styling.
+
+---
+
 ## Table of Contents
 
 - [How It Works](#how-it-works)

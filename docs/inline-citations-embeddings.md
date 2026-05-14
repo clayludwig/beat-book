@@ -1,18 +1,22 @@
-# Inline citations from sentence embeddings: how the beat book stays attributable
+# Inline citations from passage embeddings: how the beat book stays attributable
 
 A reporter using the beat book needs to know which sentences came from which source story — both to verify claims and to follow the citation back to the article and byline they can call. The agent doesn't write notes like "according to source #3"; it paraphrases, summarizes, and synthesizes. So we attribute after the fact, by matching each generated sentence against the source corpus the agent had access to.
 
-This is the embeddings-based inline citation pipeline. It lives in `citation_matcher.py`, runs as the last stage of the pipeline (after the draft agent and after the research agent), and produces the per-sentence attribution metadata the viewer uses to wrap clickable spans around any beat-book sentence whose nearest source neighbor is similar enough.
+This is the embeddings-based inline citation pipeline. It lives in `citation_matcher.py`, runs as the last stage of the pipeline (after the draft agent and after the research agent), and produces the per-sentence attribution metadata the viewer uses to wrap clickable spans around beat-book sentences with their supporting source passages, plus the sub-span inside each passage that actually carries the claim.
 
 ## The shape of the solution
 
-The whole approach is three sentences long:
+The earlier version of this matcher was three sentences long: embed every source sentence, embed every beat-book sentence, take the argmax cosine match. It worked, but it had four real problems — paraphrased claims pinned to a single arbitrary source, synthesized sentences losing the contributing sources, no calibrated "no good match" signal, and sentence-vs-sentence matching with no way to point at the specific span inside a paragraph that supported a claim.
 
-1. Embed every sentence in the source stories.
-2. Embed every sentence in the beat book.
-3. For each beat-book sentence, pick the source sentence with the highest cosine similarity. If that similarity clears a threshold, treat it as the citation.
+The current pipeline still starts with embeddings and cosine similarity but adds five things on top:
 
-Everything else is the texture you need to make those three sentences work in practice — sentence splitting that doesn't choke on "Mr." or "U.S.", Markdown segmentation that knows not to embed list bullets, batched API calls that don't make 800 round-trips, and a viewer-side rendering pass that decides what to actually show.
+1. **Passages, not sentences, on the source side.** Each source story is chopped into 100-word sliding windows with 16-word overlap. The window keeps its character offset back into the original source text, so a passage hit resolves to a quoted span the viewer can highlight.
+2. **Top-K retrieval, not argmax.** For each beat-book sentence we keep up to five supporting passages, not just the best one — a sentence that synthesizes two stories can cite both.
+3. **A per-corpus calibrated threshold.** We sample random `(beat_book_sentence, source_passage)` pairs to estimate the noise floor of the similarity distribution, then cut off at `noise_mean + 3·sigma` (with an absolute floor of 0.40). Below the threshold, a candidate is dropped — no citation rather than a confidently-wrong one.
+4. **Context-sum on the beat-book side.** Pronoun-heavy or short sentences ("He denied it.") have no embedding signal alone. Each beat-book sentence's query vector is `0.6·prev + 1.0·self + 0.4·next`, summing the embeddings of paragraph-adjacent neighbors before matching.
+5. **Leave-one-out sub-window highlighting.** Once a passage is picked, we split it into six overlapping sub-windows and re-embed `passage_minus_subwindow` for each. The sub-windows whose removal most degrades similarity are the ones carrying the claim; we surface the top two as highlight offsets the viewer paints in stronger color.
+
+Everything else is plumbing — sentence splitting that doesn't choke on "Mr." or "U.S.", Markdown segmentation that knows not to embed list bullets, NumPy vectorization so the matmul stays milliseconds, and a viewer-side rendering pass that decides what to actually show.
 
 ## Step 1: sentence splitting that survives "Mr." and "U.S."
 
@@ -26,18 +30,18 @@ def split_into_sentences(text: str) -> List[str]:
         protected = re.sub(pattern, replacement, protected, flags=re.IGNORECASE)
     # Protect decimals (3.5, $10.99)
     protected = re.sub(r"(\d)\.(\d)", r"\1<<DOT>>\2", protected)
-    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z\"']|$)", protected)
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z\"'])", protected)
     sentences = [s.replace("<<DOT>>", ".").strip() for s in sentences]
     return [s for s in sentences if s and len(s) > 10]
 ```
 
-The actual split regex requires a sentence-ending punctuation mark followed by whitespace followed by a capital letter, quote, or end-of-string. The trailing length filter (`len(s) > 10`) is a cheap way to drop the inevitable two-character noise sentences that escape the abbreviation table — you'd rather miss a real ten-character sentence than create a citation for "OK." or "And.".
+The actual split regex requires a sentence-ending punctuation mark followed by whitespace followed by a capital letter or quote. The trailing length filter (`len(s) > 10`) is a cheap way to drop the inevitable two-character noise sentences that escape the abbreviation table — you'd rather miss a real ten-character sentence than create a citation for "OK." or "And.".
 
-This is a regex-and-substitution approach, not a trained sentence-boundary model, and that's a deliberate choice: it's predictable, has no install footprint, and the failure modes (an over-eager split on an unrecognized abbreviation) are visible in the output rather than hidden in a model's confidence score.
+This is a regex-and-substitution approach, not a trained sentence-boundary model, and that's a deliberate choice: it's predictable, has no install footprint, and the failure modes are visible in the output rather than hidden in a model's confidence score.
 
 ## Step 2: segmenting the beat book Markdown
 
-The beat book is Markdown, not prose. If you embed every line of it indiscriminately, you'll waste tokens on `## Key People`, on `- John Smith, Director of Public Affairs`, and on the literal `|---|---|---|` of a table separator. None of those should ever get a citation: headings aren't claims, list items are usually too short and too schematic to match meaningfully, and table rows would break the Markdown's own GFM parsing if we wrapped them in HTML spans (a row that doesn't start with `|` ceases to be a row).
+The beat book is Markdown, not prose. If you embed every line of it indiscriminately, you'll waste tokens on `## Key People`, on `- John Smith, Director of Public Affairs`, and on the literal `|---|---|---|` of a table separator. None of those should ever get a citation: headings aren't claims, list items are usually too short and too schematic to match meaningfully, and table rows would break the Markdown's own GFM parsing if we wrapped them in HTML spans.
 
 So segmentation is a two-pass loop that flags each line as either "embed me" or "pass through":
 
@@ -66,129 +70,190 @@ for line in markdown.split("\n"):
         entries.append({"content": line, "needs_embedding": False})
 ```
 
-The output is a flat list of entries, each with `content` and `needs_embedding`. Paragraph lines explode into one entry per sentence (so a five-sentence paragraph becomes five separate entries, each independently citable); everything else is a single entry that passes through verbatim. This is what lets the downstream code embed in bulk and then walk the entry list to assemble the JSON output, knowing exactly which entries got an embedding and which didn't.
+The output is a flat list of entries, each with `content` and `needs_embedding`. Paragraph lines explode into one entry per sentence; everything else passes through verbatim. The viewer walks the entry list to assemble HTML, knowing exactly which entries got an embedding pass and which didn't.
 
-## Step 3: batched embeddings
+## Step 3: sliding-window passages on the source side
 
-Both passes — embedding the source corpus and embedding the beat book — go through `_embed_many`, which slices texts into chunks of `EMBED_BATCH_SIZE = 256` and dispatches each chunk to OpenAI's `text-embedding-3-small` in a single HTTP call:
+Source stories don't get split into sentences any more. They get split into 100-word sliding windows with 16-word overlap — roughly 128-token windows with the kind of ~12% overlap that the semantic-search literature (`semantra`, several embedding-search demos) settled on by trial and error. The motivation is straightforward: a paragraph-shaped chunk gives the embedding model real context to encode against, and that context is what makes paraphrased and summarized claims attribute correctly. A single source sentence is often missing the very subject or verb the beat-book sentence is referring to.
 
 ```python
-EMBED_BATCH_SIZE = 256
+PASSAGE_WORDS = 100
+PASSAGE_OVERLAP_WORDS = 16
 
-def _embed_batch(client: OpenAI, texts: List[str]) -> List[List[float]]:
-    if not texts:
-        return []
-    cleaned = [t if t.strip() else " " for t in texts]
-    resp = client.embeddings.create(model=EMBED_MODEL, input=cleaned)
-    return [item.embedding for item in resp.data]
+def _passage_windows(text: str, ...) -> List[Dict[str, Any]]:
+    words = _tokenize_with_offsets(text)
+    step = max(1, window_words - overlap_words)
+    out = []
+    i = 0
+    while i < n_words:
+        j = min(n_words, i + window_words)
+        first_word_start = words[i][1]
+        last_word_end = words[j - 1][2]
+        out.append({
+            "text": text[first_word_start:last_word_end],
+            "char_offset": first_word_start,
+            "char_length": last_word_end - first_word_start,
+            "word_start": i,
+            "word_end": j,
+        })
+        if j >= n_words: break
+        i += step
+    return out
 ```
+
+Every passage carries the character offset back into the original source text. That's what makes the leave-one-out highlighting later in the pipeline work — once we know the passage carries the claim, we want to point at the exact sub-span inside it, not at "somewhere in this paragraph."
+
+## Step 4: batched embeddings
+
+Both passes — embedding the source passages and embedding the beat-book sentences — go through `_embed_many`, which slices texts into chunks of `EMBED_BATCH_SIZE = 256` and dispatches each chunk to OpenAI's `text-embedding-3-small` in a single HTTP call.
 
 The OpenAI embeddings API accepts up to 2048 inputs per call; the lower cap of 256 keeps individual payloads small enough that a transient connection problem retries cheaply. The empty-string defense (`t if t.strip() else " "`) is mandatory: the API rejects an empty input and the rejection is for the *whole batch*, so a single zero-length sentence anywhere in the list nukes the round-trip.
 
-A typical small corpus — a few hundred articles, each maybe twenty to fifty sentences — is six or eight thousand sentences total, which is thirty-ish HTTP calls. Even on an unhurried connection that completes in well under a minute. There's no caching layer between this code and the API; if you re-run the pipeline you re-embed. That's tolerable here because the source corpus changes between runs (each run is a different reporter with a different set of source stories) and embedding costs at this scale are pennies. The pipeline elsewhere does cache embeddings (see `.cache/embeddings.pkl` in the topic-discovery stage), but the citation matcher has been left uncached on purpose.
+A typical small corpus — a few hundred articles, each maybe ten passages — is a few thousand passages plus a few hundred beat-book sentences, which is a handful of HTTP calls. Even on an unhurried connection that completes in well under a minute. There's no caching layer between this code and the API; if you re-run the pipeline you re-embed.
 
-## Step 4: brute-force matching
+## Step 5: context-sum queries
 
-Once both sides have embeddings, matching is straightforward cosine similarity, comparing every beat-book sentence against every source sentence:
+A beat-book sentence like "He denied it." has almost no embedding signal on its own — three closed-class words and a pronoun. The same goes for short verbless headers ("The aftermath."), and for any sentence whose meaning depends on antecedents we'd otherwise be embedding away.
+
+The fix is to weight each beat-book sentence's query vector with its paragraph-adjacent neighbors before matching:
 
 ```python
-def _cosine_similarity(a: List[float], b: List[float]) -> float:
-    dot = 0.0
-    mag_a = 0.0
-    mag_b = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        mag_a += x * x
-        mag_b += y * y
-    if mag_a == 0 or mag_b == 0:
-        return 0.0
-    return dot / (math.sqrt(mag_a) * math.sqrt(mag_b))
+CTX_WEIGHT_PREV = 0.6
+CTX_WEIGHT_SELF = 1.0
+CTX_WEIGHT_NEXT = 0.4
+
+def _context_sum_embeddings(raw, indices_in_sentence_stream):
+    out = raw.copy() * CTX_WEIGHT_SELF
+    for i in range(len(raw)):
+        my_pos = indices_in_sentence_stream[i]
+        if i - 1 >= 0 and indices_in_sentence_stream[i - 1] == my_pos - 1:
+            out[i] += CTX_WEIGHT_PREV * raw[i - 1]
+        if i + 1 < len(raw) and indices_in_sentence_stream[i + 1] == my_pos + 1:
+            out[i] += CTX_WEIGHT_NEXT * raw[i + 1]
+    return out
 ```
 
-This is `O(M × N)` where `M` is the number of beat-book sentences (low hundreds) and `N` is the number of source sentences (low thousands). It's a few hundred thousand multiply-adds per beat book — milliseconds, even in pure Python. Anything fancier would be premature: no FAISS, no Annoy, no IVF index, no GPU. The day a single beat book sources from a million articles, that calculus changes; today it doesn't, and a brute-force loop is far easier to debug than a vector-database integration.
+The previous sentence gets more weight than the next because pronouns and ellipsis typically refer backward, not forward. Paragraph boundaries gate the sum — a sentence at position zero in its paragraph has no `prev`. Then everything gets L2-normalized so the matmul is a dot product directly.
 
-The match function returns the best source sentence as a plain dict — article id, sentence text, sentence index, similarity score, article title, date, author. That dict gets attached to the entry as the citation payload.
+## Step 6: vectorized matching
 
-## Step 5: the threshold
+Once both sides have embeddings, we L2-normalize both matrices and multiply them. That's it — no Annoy, no FAISS, no IVF index.
 
-Cosine similarity always returns *some* number, even between two utterly unrelated sentences. The "best" match for a beat-book sentence that has no real source — for example, a fact the research agent added from the open web — is still going to be a real number, and the corresponding source sentence is going to look like a citation in the output unless something filters it out.
-
-That something is a threshold, applied in the viewer rather than the matcher:
-
-```javascript
-const SIMILARITY_THRESHOLDS = {
-    immigration_enforcement_beat_book: 0.67,
-};
-const SIMILARITY_THRESHOLD = SIMILARITY_THRESHOLDS[bookStem] ?? 0.65;
+```python
+beat_emb_norm = _l2_normalize(ctx_beat)               # (M, d)
+source_emb_norm = source_index["embeddings"]          # (N, d), already normalized
+sim_matrix = beat_emb_norm @ source_emb_norm.T        # (M, N)
 ```
 
-The default is 0.65; one beat book — `immigration_enforcement_beat_book` — has been bumped to 0.67 because its source corpus produced an unusually high baseline of incidental similarity (lots of similar boilerplate around DHS press releases). The right way to tune this for a new beat is to scan the borderline matches by hand: pull the entries with similarity between 0.60 and 0.70 from the JSON, look at the beat-book sentence next to its claimed source sentence, and decide where the line falls between "yes, that sentence really came from this source" and "no, the model is just pattern-matching DHS-shaped text." Bump or lower the threshold for that book accordingly.
+For our corpus sizes (a few hundred beat-book sentences × a few thousand source passages) this fits comfortably in memory and runs in single-digit milliseconds. Vector databases would help if either side were larger by an order of magnitude or two; today they aren't.
 
-The threshold lives in the viewer rather than in the matcher because the matcher's output is the underlying data — every entry's best match, with its real similarity score — and the threshold is a presentation choice that you might want to revisit without re-running the embedding pipeline. If you ever want a "show all citations regardless of confidence" debug mode, it's a one-line change in the viewer.
+## Step 7: per-corpus calibrated threshold
 
-## Step 6: rendering with run-grouping
+Cosine similarity always returns *some* number, even between two utterly unrelated sentences. The earlier version of this pipeline hardcoded a per-book threshold in the viewer (`SIMILARITY_THRESHOLDS = { immigration_enforcement_beat_book: 0.67, ... }`) — every new beat book required hand-tuning the cutoff or accepting the 0.65 default. That's not robust.
 
-A beat book paragraph that summarizes one source story typically has five or six sentences, all of which match (correctly) to the same `article_id`. Wrapping every one of them in a clickable span is visually punishing: the entire paragraph turns into a wall of underlined links, the user can't tell where one source ends and another begins, and the click target becomes ambiguous.
+We replace it with a calibration step that runs once per corpus, against the same embedding matrices we just built:
 
-The viewer's fix is run-grouping. It walks the entry list keeping track of the previous entry's source. Only the *first* entry in a run of consecutive same-source entries gets wrapped:
+```python
+CALIB_RANDOM_SAMPLES = 4000
+CALIB_SIGMA = 3.0
+CALIB_ABSOLUTE_FLOOR = 0.40
 
-```javascript
-let previousSource = null;
-const markdown = beatbookData.map((entry, index) => {
-    const hasSufficientSimilarity = entry.similarity !== undefined ? entry.similarity >= SIMILARITY_THRESHOLD : true;
-    const isValidSource = entry.source && storiesData.some(s => s.article_id === entry.source);
-    const isTableRow = entry.content.trimStart().startsWith('|');
-    if (isValidSource && hasSufficientSimilarity && !isTableRow) {
-        const isFirstInRun = entry.source !== previousSource;
-        previousSource = entry.source;
-        if (isFirstInRun) {
-            return `[[SOURCE:${index}]]${entry.content}[[/SOURCE:${index}]]`;
-        }
-    } else {
-        previousSource = null;
-    }
-    return entry.content;
-}).join('\n');
+rng = np.random.default_rng(seed=42)
+beat_idx = rng.integers(0, n_beat, size=n_samples)
+src_idx = rng.integers(0, n_src, size=n_samples)
+sims = np.einsum("ij,ij->i", beat_emb_norm[beat_idx], source_emb_norm[src_idx])
+noise_mean = float(np.mean(sims))
+noise_std = float(np.std(sims))
+threshold = max(CALIB_ABSOLUTE_FLOOR, noise_mean + CALIB_SIGMA * noise_std)
 ```
 
-The `[[SOURCE:N]]…[[/SOURCE:N]]` sentinels are a small trick. We can't wrap the sentence in a real `<span>` before handing the text to `marked.parse()`, because raw HTML inside Markdown breaks paragraph wrapping in unpredictable ways. So we wrap it in a unique placeholder, let Marked do its parsing, then post-process the rendered HTML to swap the sentinels for the actual span:
+Random pairs of beat-book sentences and source passages are, by construction, *not* citations of each other. Their similarities form the noise floor of the corpus — the baseline of "this is what irrelevant looks like, here." Three standard deviations above that floor catches roughly 99.7% of true noise; matches at or above the threshold are the ones standing meaningfully above incidental similarity. The 0.40 absolute floor protects against the degenerate case where the corpus has very high baseline similarity (e.g., a stack of near-duplicate press releases) and the noise-floor formula would produce something laughably low.
 
-```javascript
-let html = marked.parse(markdown);
-beatbookData.forEach((entry, index) => {
-    if (entry.source) {
-        const regex = new RegExp(`\\[\\[SOURCE:${index}\\]\\](.*?)\\[\\[\\/SOURCE:${index}\\]\\]`, 'g');
-        html = html.replace(regex, (match, content) => {
-            return `<span class="sourced-content" onclick="openArticle('${entry.source}')" onmouseenter="showPreview('${entry.source}', event)" onmouseleave="hidePreview()">${content}</span>`;
-        });
-    }
-});
+The calibration block goes into the output JSON. The viewer reads it and displays the threshold in the header, so a reporter who wants to know "how confident were the citations in this book" can see it at a glance.
+
+## Step 8: top-K retrieval
+
+`argmax` would give us one best support per beat-book sentence. `argpartition` gives us the top K (we use K=5) in O(N) per sentence, and we then sort those K by similarity to pick winners in order:
+
+```python
+k = min(TOP_K, sim_matrix.shape[1])
+for row_i in range(sim_matrix.shape[0]):
+    row = sim_matrix[row_i]
+    cand_idx = np.argpartition(-row, k - 1)[:k]
+    cand_idx = cand_idx[np.argsort(-row[cand_idx])]
+    per_sentence = []
+    for col_i in cand_idx:
+        sim = float(row[col_i])
+        if sim < threshold: break
+        per_sentence.append({"passage": global_passages[col_i], "similarity": sim})
 ```
 
-The result: every "run" of same-source sentences gets a single visible link on its first sentence, the whole paragraph reads cleanly, and a click on the link opens the source article in a side panel.
+A sentence that synthesizes claims from two source stories now ends up with two supports — both visible in the data, even if the viewer chooses to show only the top one inline.
 
-## What this approach gets wrong
+## Step 9: leave-one-out sub-window highlighting
 
-It's worth being honest about the failure modes, because they're real and a reporter using this tool should know where to be skeptical of the highlighting:
+A 100-word passage is the unit we matched against, but it's too long to highlight in a viewer pane without losing the value of the highlight. The leave-one-out trick comes from `semantra`'s `/api/explain` endpoint, slightly adapted: split the matched passage into six overlapping sub-windows of about a third of the passage each, re-embed `passage_minus_subwindow` for each one, and rank sub-windows by how much removing them hurts similarity to the query.
 
-- **Synthesized sentences collapse to one match.** A beat-book sentence that fuses claims from three different source articles will only get attribution to whichever of the three it happens to be most similar to. The other two contributions disappear from the citation trail.
-- **Below-threshold sentences get no attribution at all, even if they have one.** A beat-book sentence that paraphrases its source heavily (different vocabulary, restructured grammar) can fall below the threshold and look uncited. The fix in those cases is to lower the threshold or rewrite the sentence closer to the source — but you don't get a warning that this happened; the sentence just appears un-highlighted.
-- **A "best" match always exists.** If the agent inserts a fact it made up — or a fact it pulled from the open web during the research stage — the matcher will still return a closest-source-sentence, and only the threshold prevents that from rendering as a citation. A poorly-chosen threshold (too low) will surface bogus links.
-- **Sentence-level granularity is the unit.** No clause-level highlighting; no paragraph-level fall-through; no tracing a single named entity from beat book back to source mention. This was a deliberate simplification — sentences are the natural attributional unit for journalism — but it means a very long sentence with a contestable mid-clause and an uncontestable head-clause gets one citation for the whole thing.
+```python
+sims = passage_minus_subwindow_embeddings @ query_vec
+contributions = base_similarity - sims   # bigger = removing this sub-window hurt more
+order = np.argsort(-contributions)
+top_highlights = [sub_ranges[i] for i in order[:LOO_TOP_HIGHLIGHTS] if contributions[i] > 0]
+```
+
+The two sub-windows with the largest "removal hurt most" scores are the ones carrying the claim. They go into the output JSON as `highlights[]` — char offsets the viewer paints in stronger amber inside the lighter-amber passage band.
+
+This is by far the most expensive step in the pipeline: it's an additional embedding batch per kept candidate, with `LOO_SUBWINDOWS_PER_PASSAGE = 6` embeds per passage. We run it only on candidates that passed the threshold and made the top-K cut, so it scales with the number of *useful* citations rather than the size of the corpus.
+
+## Step 10: the JSON shape and the viewer
+
+The matcher returns a single dict:
+
+```json
+{
+  "calibration": { "threshold": 0.51, "noise_mean": 0.18,
+                   "noise_std": 0.11, "sigma": 3.0, "samples": 4000 },
+  "entries": [
+    { "content": "...", "passthrough": false,
+      "supports": [
+        { "article_id": "story-3", "article_title": "...", "article_date": "...",
+          "passage_text": "the full ~100-word matched window",
+          "passage_offset": 1234, "passage_length": 678,
+          "similarity": 0.72,
+          "highlights": [ { "char_offset": 1289, "char_length": 56,
+                            "contribution": 0.18 } ] },
+        ...
+      ] },
+    ...
+  ]
+}
+```
+
+The viewer (`static/viewer/viewer.js`) reads the calibration and surfaces it as a header label. For each entry with at least one support, it wraps the sentence's run-leader with a clickable span (run-grouping is unchanged — consecutive same-source sentences still get one visible link on the first). Clicking the link opens the source article in a side panel and the panel renders the raw article text with two tiers of `<mark>` highlighting: the matched 100-word passage in light amber, and the leave-one-out sub-window(s) inside it in stronger amber. The panel scrolls to the first highlight.
+
+A small score chip after each citation link shows the similarity value — color-coded into three bands (green ≥0.6, amber ≥0.5, grey below). A reporter who wants to know "how confidently is this citation pinned to that source" can see it without opening the side panel.
+
+## What this approach still gets wrong
+
+It's worth being honest about the failure modes:
+
+- **The calibration floor is statistical, not labeled.** We're computing a noise threshold from random pairs, not from labeled "matches" vs. "non-matches." The threshold catches obvious noise but doesn't guarantee that every above-threshold hit is a real attribution — a beat-book sentence and a source passage can share enough surface signal to clear three sigma without actually being about the same thing.
+- **Top-K shows the top candidate inline only.** The data carries up to five supports per sentence, but the current viewer only renders the top one. A reporter who wants to see alternates has to open the JSON. (This is an obvious next viewer iteration.)
+- **Leave-one-out is local.** It tells you which sub-span inside the matched passage most contributes to the match — but if the *real* supporting sub-span is split across two passage windows, the sub-window we highlight in either window is at best half the story.
+- **Synthesized sentences from the open web are still hit-or-miss.** The research agent adds material from web searches that the source corpus doesn't contain. Those sentences should fall below threshold and get no citation. They usually do, but a sentence that happens to share vocabulary with a source story can still cross the threshold and get a misleading link.
+- **Run-grouping still hides individual claims.** A paragraph of five sentences all citing the same source gets one visible link on the first sentence. That's good for readability, but a reporter who wants to verify the *third* sentence specifically has to click the run leader and trust that the passage covers all five.
 
 ## Why this approach in particular
 
-A few things made this the right shape, given the constraints:
-
-- **No vector database.** A FAISS or LanceDB index would let you scale to millions of sentences, but the corpus per beat book is hundreds to low thousands. Brute-force search over a Python list of dicts is fast enough that the cost of the dependency would dwarf the cost of the search.
-- **Sentence-level rather than paragraph-level.** The viewer wants to highlight the specific claim, not the whole bullet. A paragraph-level approach would over-attribute.
-- **OpenAI's small embedding model rather than a local one.** Anthropic — which hosts the project's chat slots — does not offer an embedding API, only chat. A self-hosted Ollama with `mxbai-embed-large` would work, but the project is meant to run anywhere without a local daemon, so a hosted embedding API was the only path that wouldn't bind a fresh checkout to a particular machine. The marginal cost of `text-embedding-3-small` at this scale is too low to argue with.
-- **Threshold in the viewer, not the matcher.** Keeps the underlying JSON debuggable and tweak-able without re-running embeddings.
+- **Passages on the source side, sentences on the beat-book side.** The asymmetry is intentional. The beat-book is what we're trying to attribute — sentence-level granularity is the natural unit of a claim. The source corpus is what we're attributing *from* — passage-level chunks give the embedding model real context to encode against and are what make paraphrased and synthesized claims attribute correctly.
+- **NumPy, not a vector database.** At a few thousand vectors per side, a single matmul is faster than any approximate-nearest-neighbor index would be after the query overhead. The day a single beat book sources from a million articles, that calculus changes; today it doesn't.
+- **Calibration in the data, not in the viewer.** Hardcoding a threshold per book meant every new beat book required hand-tuning. Sampling random pairs is one shot, deterministic (we seed the RNG at 42), and produces a number any reader of the JSON can interrogate.
+- **`text-embedding-3-small`, hosted.** Anthropic — which hosts the project's chat slots — does not offer an embedding API. A local Ollama with `mxbai-embed-large` would work, but the project is meant to run anywhere without a local daemon, so a hosted embedding API was the only path that wouldn't bind a fresh checkout to a particular machine.
 
 ## How this stage cohabits with the research agent
 
-The pipeline runs in three stages: the draft agent produces a beat book from the source corpus, the research agent deepens it with live web research, and then the citation matcher runs. By the time the matcher sees the markdown, some sentences came from source stories the agent originally read, and some sentences came from the open web (a Tribune article from last month, an Open Data Chicago dataset, a city council vote).
+The pipeline runs in three stages: the draft agent produces a beat book from the source corpus, the research agent deepens it with live web research, and then the citation matcher runs. By the time the matcher sees the markdown, some sentences came from source stories the agent originally read, and some sentences came from the open web.
 
-The matcher doesn't need to know which is which. The web-sourced sentences won't have a meaningful match in the reporter's source corpus and will fall below the threshold — exactly the right outcome, since those sentences shouldn't link to a source they didn't come from. The threshold is what makes this graceful: the citation matcher doesn't need provenance metadata about who wrote each sentence; the absence of a real source naturally surfaces as the absence of a link in the rendered output.
+The matcher doesn't need to know which is which. The web-sourced sentences won't have a meaningful match in the reporter's source corpus and will fall below the calibrated threshold — exactly the right outcome, since those sentences shouldn't link to a source they didn't come from. The threshold is what makes this graceful: the citation matcher doesn't need provenance metadata about who wrote each sentence; the absence of a real match naturally surfaces as the absence of a link in the rendered output.
 
-That's the whole composition: a research agent that adds live context inline, a citation matcher that attributes whatever it can attribute and silently drops the rest, and a viewer that renders the surviving citations as discreet, clickable spans. The reporter ends up with a document that reads like prose, behaves like a footnoted article when they hover, and lets them follow any specific claim back to its source in a single click.
+That's the whole composition: a research agent that adds live context inline, a citation matcher that attributes whatever the data supports above noise and silently drops the rest, and a viewer that renders the surviving citations as discreet, clickable spans with the actual supporting sub-span highlighted in the source. The reporter ends up with a document that reads like prose, behaves like a footnoted article when they hover, and lets them follow any specific claim back to its exact source sentence in a single click.
