@@ -1,13 +1,66 @@
 # Beat Book Builder
 
-A web application that turns a collection of news articles into an interactive, AI-generated **beat book** — a practical reporting guide for journalists covering a specific topic area. Upload source articles in any common format (Word, PDF, HTML, markdown, plain text, JSON) or paste URLs, and the system extracts the stories, lets you review them, then automatically discovers topics via embedding and clustering before walking the reporter through an AI-guided interview to produce a tailored beat book.
+A web application that turns a collection of news articles into an interactive **beat book** — a practical reporting guide for journalists covering a specific topic area. Upload source articles in any common format (Word, PDF, HTML, markdown, plain text, JSON) or paste URLs, and the system extracts the stories, lets you review them, then automatically discovers topics via embedding and clustering before walking the reporter through an AI-guided interview to produce a tailored beat book.
 
 Originally built around [Chicago Public Media](https://chicago.suntimes.com/) story data; works with any news corpus regardless of source format.
 
 ---
 
+## Setup & Running
+
+### Prerequisites
+
+- Python 3.9+
+- An [OpenAI API key](https://platform.openai.com/api-keys) (used only for embeddings — `text-embedding-3-small`)
+- An [Anthropic API key](https://console.anthropic.com/) (used for `claude-sonnet-4-6` — story normalization, cluster labeling, the interview agent — and `claude-opus-4-7` for the research agent)
+
+No local daemons required — everything runs through hosted APIs, so the project is portable across machines.
+
+### Install
+
+```bash
+pip install -r requirements.txt
+```
+
+Or with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv pip install -r requirements.txt
+```
+
+### Configure
+
+Create a `.env` file in the project root (see `.env.example`):
+
+```
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Optional — extended thinking on Sonnet 4.6 (slower, higher quality).
+# Default: off. Ignored by the ingest normalization step, which forces
+# tool_choice and is incompatible with thinking.
+# ENABLE_THINKING=true
+```
+
+### Run
+
+```bash
+python -m uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+or with uv:
+
+```bash
+uv run python -m uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+Then open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser.
+
+---
+
 ## Table of Contents
 
+- [Setup & Running](#setup--running)
 - [How It Works](#how-it-works)
 - [Architecture Overview](#architecture-overview)
 - [Ingest: Files, URLs, and the Preview Screen](#ingest-files-urls-and-the-preview-screen)
@@ -24,7 +77,6 @@ Originally built around [Chicago Public Media](https://chicago.suntimes.com/) st
   - [Agent Loop](#agent-loop)
 - [Frontend](#frontend)
 - [Tech Stack](#tech-stack)
-- [Setup & Running](#setup--running)
 - [Project Structure](#project-structure)
 
 ---
@@ -264,46 +316,6 @@ The frontend is a single-page app with four screens:
 
 ---
 
-## Setup & Running
-
-### Prerequisites
-
-- Python 3.9+
-- An [OpenAI API key](https://platform.openai.com/api-keys) (used only for embeddings — `text-embedding-3-small`)
-- An [Anthropic API key](https://console.anthropic.com/) (used for `claude-sonnet-4-6` — story normalization, cluster labeling, the interview agent — and `claude-opus-4-7` for the research agent)
-
-No local daemons required — everything runs through hosted APIs, so the project is portable across machines.
-
-### Install
-
-```bash
-pip install -r requirements.txt
-```
-
-### Configure
-
-Create a `.env` file in the project root:
-
-```
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Optional — extended thinking on Sonnet 4.6 (slower, higher quality).
-# Default: off. Ignored by the ingest normalization step, which forces
-# tool_choice and is incompatible with thinking.
-# ENABLE_THINKING=true
-```
-
-### Run
-
-```bash
-python -m uvicorn app:app --host 127.0.0.1 --port 8000
-```
-
-Then open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser.
-
----
-
 ## Project Structure
 
 ```
@@ -316,6 +328,8 @@ beat-book/
 ├── research_agent.py       # Sandboxed research agent that revises the draft beat book
 ├── citation_matcher.py     # Matches beat-book claims back to source sentences
 ├── requirements.txt        # Python dependencies
+├── Makefile                # Install, run, dev, lint, clean targets
+├── .env.example            # Template for required API keys
 ├── static/
 │   ├── index.html          # Single-page app markup (upload, preview, interview, done)
 │   ├── app.js              # Frontend logic — ingest, preview, SSE pipeline, WebSocket
@@ -325,3 +339,11 @@ beat-book/
 ├── output/                 # Generated beat books (Markdown + sources JSON)
 └── .cache/                 # Embedding cache (auto-generated)
 ```
+
+---
+
+## Authors
+
+- [Clay Ludwig](https://clayludwig.com/)
+- [Cat Murphy](https://github.com/catelizabethmurphy)
+- [Derek Willis](https://thescoop.org/)
