@@ -12,10 +12,10 @@ Public entry points:
 - build_sources_file(stories, source_embeddings) -> list[dict]
 """
 
-import math
 import re
 from typing import Callable, List, Dict, Any, Optional
 
+import numpy as np
 from openai import OpenAI
 
 # Progress callback signature: (stage_label, fraction_0_to_1, detail)
@@ -255,47 +255,57 @@ def embed_source_stories(
 # MATCHING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _cosine_similarity(a: List[float], b: List[float]) -> float:
-    dot = 0.0
-    mag_a = 0.0
-    mag_b = 0.0
-    for x, y in zip(a, b):
-        dot += x * y
-        mag_a += x * x
-        mag_b += y * y
-    if mag_a == 0 or mag_b == 0:
-        return 0.0
-    return dot / (math.sqrt(mag_a) * math.sqrt(mag_b))
-
-
-def _find_best_match(embedding: List[float], source_embeddings: List[Dict[str, Any]]) -> Dict[str, Any]:
-    best = {
-        "article_id": None,
-        "sentence_text": "",
-        "sentence_index": -1,
-        "similarity": -1.0,
-        "article_title": "",
-        "article_date": "",
-        "article_author": "",
-    }
+def _build_source_index(source_embeddings: List[Dict[str, Any]]):
+    """Flatten all source-story sentences into a NumPy matrix for vectorized
+    cosine-similarity search.  Returns (matrix, meta_list) where matrix is
+    shape (N, dim) of L2-normalised float32 vectors and meta_list[i] holds
+    the sentence metadata dict at row i."""
+    flat_meta: List[Dict[str, Any]] = []
+    flat_vecs: List[List[float]] = []
     for article in source_embeddings:
         aid = article.get("article_id", "")
-        for sentence_data in article.get("sentences", []):
-            emb = sentence_data.get("embedding")
+        for sd in article.get("sentences", []):
+            emb = sd.get("embedding")
             if emb is None:
                 continue
-            sim = _cosine_similarity(embedding, emb)
-            if sim > best["similarity"]:
-                best = {
-                    "article_id": aid,
-                    "sentence_text": sentence_data.get("text", ""),
-                    "sentence_index": sentence_data.get("index", 0),
-                    "similarity": sim,
-                    "article_title": article.get("title", ""),
-                    "article_date": article.get("date", ""),
-                    "article_author": article.get("author", ""),
-                }
-    return best
+            flat_meta.append({
+                "article_id": aid,
+                "sentence_text": sd.get("text", ""),
+                "sentence_index": sd.get("index", 0),
+                "article_title": article.get("title", ""),
+                "article_date": article.get("date", ""),
+                "article_author": article.get("author", ""),
+            })
+            flat_vecs.append(emb)
+
+    if not flat_vecs:
+        return None, flat_meta
+
+    matrix = np.array(flat_vecs, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    matrix /= np.maximum(norms, 1e-10)
+    return matrix, flat_meta
+
+
+def _find_best_match_vectorized(
+    embedding: List[float],
+    source_matrix: "np.ndarray | None",
+    flat_meta: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    empty = {
+        "article_id": None, "sentence_text": "", "sentence_index": -1,
+        "similarity": -1.0, "article_title": "", "article_date": "", "article_author": "",
+    }
+    if source_matrix is None or not flat_meta:
+        return empty
+    vec = np.array(embedding, dtype=np.float32)
+    norm = float(np.linalg.norm(vec))
+    if norm < 1e-10:
+        return {**flat_meta[0], "similarity": 0.0}
+    vec /= norm
+    sims = source_matrix @ vec          # (N,) — one matrix-vector multiply
+    idx = int(np.argmax(sims))
+    return {**flat_meta[idx], "similarity": float(sims[idx])}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -324,6 +334,10 @@ def markdown_to_beatbook_entries(
 
     embeddings = _embed_many(client, to_embed_texts, on_progress, "embedding_beatbook")
 
+    # Pre-build the normalised source matrix once so each beat-book sentence
+    # does one matrix-vector multiply instead of a Python nested loop.
+    source_matrix, flat_meta = _build_source_index(source_embeddings)
+
     # Walk through entries and assemble the output.
     out: List[Dict[str, Any]] = []
     embed_iter = iter(zip(to_embed_indices, embeddings))
@@ -335,7 +349,7 @@ def markdown_to_beatbook_entries(
     for i, entry in enumerate(entries):
         if next_embed is not None and next_embed[0] == i:
             _, emb = next_embed
-            match = _find_best_match(emb, source_embeddings)
+            match = _find_best_match_vectorized(emb, source_matrix, flat_meta)
             out.append(
                 {
                     "content": entry["content"],

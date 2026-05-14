@@ -33,17 +33,19 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
+import threading
 from urllib.parse import urlparse
 
 import anthropic
 import httpx
 
 from claude_client import (
+    ANTHROPIC_SEMAPHORE,
     CHAT_MODEL,
     RATE_LIMIT_MAX_RETRIES,
-    RATE_LIMIT_PAUSE_SECONDS,
     chat_client,
+    rate_limit_pause,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,10 +57,14 @@ logger = logging.getLogger(__name__)
 MAX_FILE_BYTES = 25 * 1024 * 1024            # 25 MB per file
 URL_FETCH_TIMEOUT = 15.0                     # seconds
 URL_USER_AGENT = "BeatBookBuilder/1.0 (+https://github.com/clayludwig/beat-book)"
-NORMALIZE_MODEL = CHAT_MODEL
+NORMALIZE_MODEL = "claude-haiku-4-5-20251001"
+# OCR settings for scanned PDFs (rendered via PyMuPDF, transcribed via Haiku vision).
+OCR_DPI = 150
+OCR_PAGES_PER_BATCH = 4   # images per Haiku vision call
+OCR_MAX_PAGES = 100        # cap for very large scanned PDFs
 # Max tokens per LLM call. Sized to fit marker data for up to ~30 stories
 # per chunk.
-NORMALIZE_MAX_TOKENS = 32768
+NORMALIZE_MAX_TOKENS = 4096
 # Number of attempts per chunk when the model returns no tool call. With
 # tool_choice forced this should be rare, but one retry covers transients.
 NORMALIZE_MAX_ATTEMPTS = 2
@@ -73,33 +79,15 @@ WINDOW_OVERLAP = 15_000          # chars of overlap between adjacent chunks
 # the largest input the 25 MB raw-file cap could produce after extraction
 # (≈50 MB of HTML-stripped text at ~100 KB per chunk).
 MAX_CHUNKS = 500
-# One chunk at a time per document. Anthropic's concurrent-request limits
-# are tight on lower tiers, and the SDK already retries 429s with
-# retry-after backoff, so serial keeps the request rate low enough that
-# big multi-chunk uploads stop tripping the limit at all.
-NORMALIZE_CONCURRENCY = 1
-# Sleep between chunks so requests don't fire back-to-back the instant
-# Anthropic frees a connection slot — gives their concurrent-connection
-# accounting a moment to settle between calls.
-INTER_CHUNK_PAUSE_SECONDS = 2.0
+NORMALIZE_CONCURRENCY = 4
 # Record separator emitted by _extract_json for top-level JSON lists.
 # When present in the extracted text, _make_chunks packs whole records
 # into each chunk so a story body is never split across two chunks.
 RECORD_SEPARATOR = "\n\n---\n\n"
 
 # Extensions markitdown converts to readable markdown.
-_MARKITDOWN_EXTS = {
-    ".docx", ".doc",
-    ".pdf",
-    ".html", ".htm",
-    ".pptx", ".ppt",
-    ".xlsx", ".xls",
-    ".csv",
-    ".rtf",
-    ".epub",
-}
 # Extensions we read directly as utf-8 text.
-_TEXT_EXTS = {".txt", ".md", ".markdown", ".log"}
+_TEXT_EXTS = {".txt", ".md", ".markdown", ".log", ".csv"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,16 +99,25 @@ class IngestError(Exception):
     """Raised when a single source can't be ingested. Surfaced to the user."""
 
 
+CONTENT_TYPES = frozenset({
+    "article", "document", "dataset", "report",
+    "transcript", "press_release", "post", "other",
+})
+
+
 @dataclass
 class Story:
-    """A single normalized story. Output of stage 2."""
+    """A single normalized content entry. Output of stage 2."""
     title: str
     content: str
     date: str = ""
     author: str = ""
+    organization: str = ""
     link: str = ""
-    confidence: str = "medium"   # "high" | "medium" | "low"
-    reasoning: str = ""          # one-sentence justification for the preview UI
+    content_type: str = "article"   # one of CONTENT_TYPES
+    metadata: dict = field(default_factory=dict)  # type-specific fields
+    confidence: str = "medium"      # "high" | "medium" | "low"
+    reasoning: str = ""             # one-sentence justification for the preview UI
 
     def to_pipeline_dict(self) -> dict:
         """Shape consumed by pipeline.py / agent.py / citation_matcher.py."""
@@ -129,8 +126,14 @@ class Story:
             out["date"] = self.date
         if self.author:
             out["author"] = self.author
+        if self.organization:
+            out["organization"] = self.organization
         if self.link:
             out["link"] = self.link
+        if self.content_type:
+            out["content_type"] = self.content_type
+        if self.metadata:
+            out["metadata"] = self.metadata
         return out
 
     def to_preview_dict(self) -> dict:
@@ -140,7 +143,10 @@ class Story:
             "content": self.content,
             "date": self.date,
             "author": self.author,
+            "organization": self.organization,
             "link": self.link,
+            "content_type": self.content_type,
+            "metadata": self.metadata,
             "confidence": self.confidence,
             "reasoning": self.reasoning,
         }
@@ -169,6 +175,130 @@ class IngestedSource:
             "char_count": self.char_count,
             "truncated": self.truncated,
         }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRUCTURED JSON FAST PATH
+# ─────────────────────────────────────────────────────────────────────────────
+# When a JSON file is a recognisable list of story-like objects (RSS feeds,
+# news API responses, the chicago-public-media daily exports) the metadata
+# is already explicit — no LLM call needed. We detect the structure, map
+# fields directly, and skip normalization entirely.
+
+_STORY_CONTENT_KEYS = ("summary", "content", "body", "text", "description",
+                        "content_html", "content:encoded")
+_STORY_DATE_KEYS    = ("published", "date", "pubDate", "pub_date",
+                        "created_at", "updated_at", "timestamp")
+_STORY_AUTHOR_KEYS  = ("author", "byline", "creator", "dc:creator")
+_STORY_LINK_KEYS    = ("link", "url", "href", "guid")
+_STORY_LIST_KEYS    = ("entries", "items", "stories", "articles",
+                        "results", "data", "posts", "feed")
+_MIN_CONTENT_CHARS  = 50
+
+
+def _extract_story_list(data) -> Optional[list]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in _STORY_LIST_KEYS:
+            v = data.get(key)
+            if isinstance(v, list) and v:
+                return v
+    return None
+
+
+def _rendered_field(value) -> str:
+    """Return a string from a raw value or a WP-style {rendered: ...} object."""
+    if isinstance(value, dict):
+        rendered = value.get("rendered")
+        return str(rendered).strip() if rendered else ""
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def _looks_like_story_list(items: list) -> bool:
+    sample = [x for x in items[:10] if isinstance(x, dict)]
+    if not sample:
+        return False
+    has_title = sum(1 for x in sample if _rendered_field(x.get("title")))
+    has_content = sum(
+        1 for x in sample
+        if any(_rendered_field(x.get(k)) for k in _STORY_CONTENT_KEYS)
+    )
+    return has_title >= len(sample) * 0.8 and has_content >= len(sample) * 0.5
+
+
+def _map_json_item(item: dict, link_hint: str) -> Optional["Story"]:
+    title = _rendered_field(item.get("title"))
+    if not title:
+        return None
+
+    content_raw = ""
+    for k in _STORY_CONTENT_KEYS:
+        content_raw = _rendered_field(item.get(k))
+        if content_raw:
+            break
+    content = _clean_inline_html(content_raw).strip()
+    if len(content) < _MIN_CONTENT_CHARS:
+        return None
+
+    date = ""
+    for k in _STORY_DATE_KEYS:
+        v = item.get(k)
+        if v:
+            m = re.match(r"(\d{4}-\d{2}-\d{2})", str(v).strip())
+            if m:
+                date = m.group(1)
+                break
+
+    author = ""
+    for k in _STORY_AUTHOR_KEYS:
+        v = item.get(k)
+        if v:
+            author = str(v.get("name") if isinstance(v, dict) else v).strip()
+            if author:
+                break
+
+    link = link_hint
+    for k in _STORY_LINK_KEYS:
+        v = item.get(k)
+        if isinstance(v, dict):
+            v = v.get("rendered")
+        if v and isinstance(v, str) and v.startswith("http"):
+            link = v.strip()
+            break
+
+    return Story(
+        title=title, content=content, date=date, author=author, link=link,
+        content_type="article",
+        confidence="high",
+        reasoning="Mapped directly from structured JSON fields.",
+    )
+
+
+def _fast_json_stories(
+    raw: bytes, source_label: str, link_hint: str = ""
+) -> Optional[list["Story"]]:
+    """Return stories extracted from a structured JSON file without an LLM
+    call, or None if the structure doesn't match and normal normalization
+    should be used."""
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    items = _extract_story_list(data)
+    if not items or not _looks_like_story_list(items):
+        return None
+
+    stories = [
+        s for item in items
+        if isinstance(item, dict)
+        for s in [_map_json_item(item, link_hint)]
+        if s is not None
+    ]
+    return stories if stories else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,21 +346,242 @@ def _clean_inline_html(s: str) -> str:
     return text.strip()
 
 
-def _extract_with_markitdown(filename: str, raw: bytes) -> str:
-    """Convert binary/office formats to markdown via markitdown.
+def _extract_pdf(raw: bytes) -> str:
+    import fitz  # PyMuPDF
+    doc = fitz.open(stream=raw, filetype="pdf")
+    n_pages = len(doc)
+    pages = [page.get_text().strip() for page in doc if page.get_text().strip()]
+    doc.close()
+    if not pages and n_pages > 0:
+        raise IngestError("__SCANNED_PDF__")
+    return "\n\n".join(pages)
 
-    markitdown reads from a path, so we write the bytes to a NamedTemporaryFile
-    with the correct suffix and let it dispatch on extension.
+
+def _render_page_png(page) -> bytes:
+    import fitz
+    mat = fitz.Matrix(OCR_DPI / 72, OCR_DPI / 72)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    return pix.tobytes("png")
+
+
+def _ocr_pdf(raw: bytes, anthropic_key: str, source_label: str) -> str:
+    """OCR a scanned PDF using Claude Haiku vision.
+
+    Renders pages to PNG at OCR_DPI, batches them into groups of
+    OCR_PAGES_PER_BATCH, sends each batch to Haiku for transcription,
+    and returns the concatenated text. Caps at OCR_MAX_PAGES.
     """
-    from markitdown import MarkItDown
+    import base64
+    import fitz
 
-    suffix = _ext_of(filename) or ".bin"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
-        tmp.write(raw)
-        tmp.flush()
-        md = MarkItDown()
-        result = md.convert(tmp.name)
-        return (result.text_content or "").strip()
+    doc = fitz.open(stream=raw, filetype="pdf")
+    n_pages = len(doc)
+    if n_pages == 0:
+        doc.close()
+        raise IngestError(f"{source_label}: PDF has no pages.")
+
+    truncated = n_pages > OCR_MAX_PAGES
+    page_indices = list(range(min(n_pages, OCR_MAX_PAGES)))
+
+    page_pngs: list[bytes] = []
+    for i in page_indices:
+        page_pngs.append(_render_page_png(doc[i]))
+    doc.close()
+
+    client = chat_client(anthropic_key)
+
+    batches = [page_pngs[i:i + OCR_PAGES_PER_BATCH]
+               for i in range(0, len(page_pngs), OCR_PAGES_PER_BATCH)]
+    batch_page_nums = [page_indices[i:i + OCR_PAGES_PER_BATCH]
+                       for i in range(0, len(page_indices), OCR_PAGES_PER_BATCH)]
+
+    def _ocr_batch(pngs: list[bytes], nums: list[int]) -> str:
+        content: list[dict] = []
+        for png in pngs:
+            b64 = base64.standard_b64encode(png).decode()
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": b64},
+            })
+        label = (f"pages {nums[0]+1}–{nums[-1]+1}" if len(nums) > 1
+                 else f"page {nums[0]+1}")
+        content.append({
+            "type": "text",
+            "text": (
+                f"These are {len(pngs)} consecutive pages ({label}) from a scanned PDF. "
+                "Transcribe ALL text exactly as it appears, in reading order. "
+                "Preserve paragraph structure with blank lines between paragraphs. "
+                "Output only the transcribed text — no commentary, no page labels."
+            ),
+        })
+        for rl_attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+            try:
+                with ANTHROPIC_SEMAPHORE:
+                    resp = client.messages.create(
+                        model=NORMALIZE_MODEL,
+                        max_tokens=4096,
+                        messages=[{"role": "user", "content": content}],
+                    )
+                break
+            except anthropic.RateLimitError as e:
+                if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
+                    raise
+                pause = rate_limit_pause(rl_attempt, e)
+                logger.warning("OCR rate limited; waiting %.0fs (attempt %d/%d).",
+                               pause, rl_attempt + 1, RATE_LIMIT_MAX_RETRIES)
+                time.sleep(pause)
+        return "".join(
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        )
+
+    batch_results: list[str | None] = [None] * len(batches)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=NORMALIZE_CONCURRENCY) as ex:
+        futures = {
+            ex.submit(_ocr_batch, batches[i], batch_page_nums[i]): i
+            for i in range(len(batches))
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            i = futures[fut]
+            try:
+                batch_results[i] = fut.result()
+            except Exception as e:
+                logger.warning(
+                    "OCR batch %d/%d failed for %s: %s",
+                    i + 1, len(batches), source_label, e,
+                )
+                batch_results[i] = ""
+
+    combined = "\n\n".join(t for t in batch_results if t).strip()
+    if not combined:
+        raise IngestError(
+            f"{source_label}: OCR produced no text. The PDF may be too degraded to read."
+        )
+    if truncated:
+        combined += (
+            f"\n\n[Note: This PDF has {n_pages} pages. "
+            f"Only the first {OCR_MAX_PAGES} were processed by OCR.]"
+        )
+    return combined
+
+
+# Filename keyword → content type, checked before falling back to "document".
+_FILENAME_TYPE_HINTS: list[tuple[tuple[str, ...], str]] = [
+    (("minutes", "meeting_minutes"),                     "transcript"),
+    (("newsletter", "bulletin"),                         "report"),
+    (("report", "action_report", "disciplinary_action"), "report"),
+    (("agenda",),                                        "document"),
+    (("license", "licensure", "license_actions"),        "document"),
+    (("order", "suspension", "revocation", "reprimand",
+      "surrender", "reinstatement", "consent_order",
+      "charges", "complaint", "final_order"),             "document"),
+]
+
+
+def _infer_content_type_from_filename(filename: str) -> str:
+    """Return a content_type hint derived from the filename, or 'document'."""
+    name = Path(filename).stem.lower()
+    for keywords, ctype in _FILENAME_TYPE_HINTS:
+        if any(kw in name for kw in keywords):
+            return ctype
+    return "document"
+
+
+
+def _extract_docx(raw: bytes) -> str:
+    import io
+    import docx
+    doc = docx.Document(io.BytesIO(raw))
+    parts = []
+    for para in doc.paragraphs:
+        if para.text.strip():
+            parts.append(para.text.strip())
+    # Tables
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                parts.append(" | ".join(cells))
+    return "\n\n".join(parts)
+
+
+def _extract_pptx(raw: bytes) -> str:
+    import io
+    from pptx import Presentation
+    prs = Presentation(io.BytesIO(raw))
+    slides = []
+    for i, slide in enumerate(prs.slides, 1):
+        texts = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    t = para.text.strip()
+                    if t:
+                        texts.append(t)
+        if texts:
+            slides.append(f"[Slide {i}]\n" + "\n".join(texts))
+    return "\n\n".join(slides)
+
+
+def _extract_xlsx(raw: bytes) -> str:
+    import io
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+    sheets = []
+    for sheet in wb.worksheets:
+        rows = []
+        for row in sheet.iter_rows(values_only=True):
+            cells = [str(c) for c in row if c is not None and str(c).strip()]
+            if cells:
+                rows.append(" | ".join(cells))
+        if rows:
+            sheets.append(f"[Sheet: {sheet.title}]\n" + "\n".join(rows))
+    return "\n\n".join(sheets)
+
+
+def _extract_xls(raw: bytes) -> str:
+    import io
+    import xlrd
+    wb = xlrd.open_workbook(file_contents=raw)
+    sheets = []
+    for sheet in wb.sheets():
+        rows = []
+        for rx in range(sheet.nrows):
+            cells = [str(sheet.cell_value(rx, cx)).strip()
+                     for cx in range(sheet.ncols)
+                     if str(sheet.cell_value(rx, cx)).strip()]
+            if cells:
+                rows.append(" | ".join(cells))
+        if rows:
+            sheets.append(f"[Sheet: {sheet.name}]\n" + "\n".join(rows))
+    return "\n\n".join(sheets)
+
+
+def _extract_html(raw: bytes) -> str:
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(raw, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header"]):
+        tag.decompose()
+    return soup.get_text(separator="\n").strip()
+
+
+def _extract_rtf(raw: bytes) -> str:
+    from striprtf.striprtf import rtf_to_text
+    return rtf_to_text(_decode_text(raw)).strip()
+
+
+def _extract_epub(raw: bytes) -> str:
+    import io
+    import ebooklib
+    from ebooklib import epub
+    from bs4 import BeautifulSoup
+    book = epub.read_epub(io.BytesIO(raw))
+    parts = []
+    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        soup = BeautifulSoup(item.get_content(), "html.parser")
+        text = soup.get_text(separator="\n").strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
 
 
 def _indent(text: str, by: str = "  ") -> str:
@@ -303,28 +654,39 @@ def extract_text(filename: str, raw: bytes) -> str:
 
     ext = _ext_of(filename)
 
-    if ext == ".json":
-        return _extract_json(raw)
+    _EXTRACTORS = {
+        ".json":  lambda: _extract_json(raw),
+        ".pdf":   lambda: _extract_pdf(raw),
+        ".docx":  lambda: _extract_docx(raw),
+        ".doc":   lambda: _extract_docx(raw),
+        ".pptx":  lambda: _extract_pptx(raw),
+        ".ppt":   lambda: _extract_pptx(raw),
+        ".xlsx":  lambda: _extract_xlsx(raw),
+        ".xls":   lambda: _extract_xls(raw),
+        ".html":  lambda: _extract_html(raw),
+        ".htm":   lambda: _extract_html(raw),
+        ".rtf":   lambda: _extract_rtf(raw),
+        ".epub":  lambda: _extract_epub(raw),
+    }
 
     if ext in _TEXT_EXTS:
         return _decode_text(raw).strip()
 
-    if ext in _MARKITDOWN_EXTS:
+    if ext in _EXTRACTORS:
         try:
-            return _extract_with_markitdown(filename, raw)
+            return _EXTRACTORS[ext]()
         except Exception as e:
-            raise IngestError(f"{filename}: failed to extract — {type(e).__name__}: {e}") from e
+            raise IngestError(
+                f"{filename}: failed to extract ({ext}) — {type(e).__name__}: {e}"
+            ) from e
 
-    # Unknown — try utf-8, then markitdown as a hail-mary
+    # Unknown extension — try utf-8 decode, reject if it looks binary.
     decoded = _decode_text(raw).strip()
     if decoded and "\x00" not in decoded[:1000]:
         return decoded
-    try:
-        return _extract_with_markitdown(filename, raw)
-    except Exception as e:
-        raise IngestError(
-            f"{filename}: unsupported file type {ext!r}; could not extract text."
-        ) from e
+    raise IngestError(
+        f"{filename}: unsupported file type {ext!r}; could not extract text."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -427,65 +789,146 @@ def fetch_url(url: str) -> Tuple[str, bytes]:
 _NORMALIZE_TOOL = {
     "name": "register_stories",
     "description": (
-        "Register the news stories you found in the document. "
-        "Return is_news_content=false when the document is not news content "
-        "(e.g., reporter notes, invoices, transcripts of meetings) — in that "
-        "case return an empty stories list and explain in skip_reason."
+        "Register the content entries found in the document. "
+        "Return is_news_content=false only when the document has no journalistic value "
+        "(empty file, binary garbage, personal shopping list) — "
+        "in that case return an empty stories list and explain in skip_reason."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "is_news_content": {
                 "type": "boolean",
-                "description": "True if the document contains at least one news article or substantive story-like piece of journalism.",
+                "description": (
+                    "True if the document contains anything useful for journalism research — "
+                    "news articles, data, reports, records, legal documents, spreadsheets, etc. "
+                    "False ONLY for empty files, binary garbage, or content with zero journalistic value."
+                ),
             },
             "skip_reason": {
                 "type": "string",
-                "description": "If is_news_content is false, one short sentence explaining what the document looks like instead. Empty otherwise.",
+                "description": "If is_news_content is false, one short sentence explaining why. Empty otherwise.",
             },
             "stories": {
                 "type": "array",
-                "description": "One entry per distinct news story in the document. Split multi-story documents (e.g., a notebook with several articles). Leave empty if is_news_content is false.",
+                "description": (
+                    "One entry per distinct unit of content. "
+                    "For news: one entry per article. "
+                    "For datasets: one entry per logical table (NOT one per row). "
+                    "For long reports: one entry per major section where natural. "
+                    "Leave empty if is_news_content is false."
+                ),
                 "items": {
                     "type": "object",
                     "properties": {
+                        "content_type": {
+                            "type": "string",
+                            "enum": ["article", "document", "dataset", "report",
+                                     "transcript", "press_release", "post", "other"],
+                            "description": (
+                                "Identify the content type FIRST — it determines which metadata fields to populate.\n"
+                                "article = news story, op-ed, feature, blog post\n"
+                                "document = government filing, legal order, license record, FOIA doc, policy doc\n"
+                                "dataset = structured/tabular data: CSV, spreadsheet, database export\n"
+                                "report = research report, audit, study, white paper, annual report, board newsletter\n"
+                                "transcript = interview, hearing, deposition, meeting minutes\n"
+                                "press_release = official statement or announcement\n"
+                                "post = social media post, forum thread\n"
+                                "other = none of the above"
+                            ),
+                        },
                         "title": {
                             "type": "string",
-                            "description": "The story's headline. If no headline is present, write a 6-10 word descriptive title.",
+                            "description": (
+                                "A clear, specific title.\n"
+                                "article: the headline.\n"
+                                "document (legal order): the document's own title, e.g. 'Order of Summary Suspension'.\n"
+                                "document (license): 'License Record — [Name] ([State])'.\n"
+                                "dataset: describe the data, e.g. 'Kentucky Disciplinary Records 2020–2024'.\n"
+                                "transcript: '[Body Name] Meeting Minutes — [Date]'.\n"
+                                "report: the report's own title.\n"
+                                "If no title is present, write a 6-10 word descriptive title."
+                            ),
                         },
                         "date": {
                             "type": "string",
-                            "description": "Publication date as YYYY-MM-DD. Empty string if not present in the document.",
+                            "description": (
+                                "Most relevant date as YYYY-MM-DD.\n"
+                                "article: publication date.\n"
+                                "document (legal): order/decision/effective date.\n"
+                                "transcript: meeting date.\n"
+                                "report: release or cover date.\n"
+                                "Empty string if not present."
+                            ),
                         },
                         "author": {
                             "type": "string",
-                            "description": "Byline author. Empty string if not present. Do not put the publication name here.",
+                            "description": (
+                                "An individual person — not an institution.\n"
+                                "article: byline author.\n"
+                                "document: signing official or hearing officer if named.\n"
+                                "Leave empty for institutional documents; use 'organization' instead."
+                            ),
+                        },
+                        "organization": {
+                            "type": "string",
+                            "description": (
+                                "The institution associated with this entry.\n"
+                                "article: publication name (e.g. 'The New York Times').\n"
+                                "document: issuing board, court, or agency (e.g. 'Idaho Board of Medicine').\n"
+                                "dataset: organization that produced or owns the data.\n"
+                                "transcript: committee or board that met.\n"
+                                "report: issuing organization.\n"
+                                "Empty if not identifiable."
+                            ),
                         },
                         "link": {
                             "type": "string",
                             "description": "Source URL if present in the document. Empty string otherwise.",
                         },
+                        "metadata": {
+                            "type": "object",
+                            "description": (
+                                "Type-specific fields. Only include keys whose values are explicitly present. Use snake_case.\n\n"
+                                "article → publication_section, word_count\n"
+                                "document (legal order/action) → docket_number, action_type (e.g. Summary Suspension / Revocation / Consent Order / Public Reprimand / Reinstatement), subject_name (person or org the action concerns), jurisdiction (state/federal)\n"
+                                "document (license record) → license_number, license_status (Active/Suspended/Expired/Revoked), state, expiry_date\n"
+                                "dataset → source_organization, date_range (e.g. 2020-2024), fields (comma-separated column names), row_count\n"
+                                "report → issuing_organization, report_number\n"
+                                "transcript → body_name (full name of committee/board), meeting_format (in-person/virtual/hybrid), key_attendees\n"
+                                "press_release → contact_name, contact_email\n"
+                                "post → platform (Twitter/X/Facebook/etc.), handle"
+                            ),
+                            "additionalProperties": True,
+                        },
                         "body_starts_with": {
                             "type": "string",
-                            "description": "The first 30-80 characters of this story's body — COPIED VERBATIM from the document. This must appear exactly in the document so the server can locate the body's beginning. Start with the first sentence of the article body itself, not the title or byline.",
+                            "description": (
+                                "First 30-80 characters of this entry's body, COPIED VERBATIM from the document. "
+                                "Must appear exactly — used for substring search. "
+                                "Start after the title/header/byline."
+                            ),
                         },
                         "body_ends_with": {
                             "type": "string",
-                            "description": "The last 30-80 characters of this story's body — COPIED VERBATIM from the document. This must appear exactly in the document so the server can locate the body's end.",
+                            "description": (
+                                "Last 30-80 characters of this entry's body, COPIED VERBATIM from the document. "
+                                "Must appear exactly — used for substring search."
+                            ),
                         },
                         "confidence": {
                             "type": "string",
                             "enum": ["high", "medium", "low"],
-                            "description": "high = metadata is explicit in the text. medium = metadata is reasonably inferred. low = metadata is a guess.",
+                            "description": "high = metadata explicit in text. medium = reasonably inferred. low = a guess.",
                         },
                         "reasoning": {
                             "type": "string",
-                            "description": "One sentence explaining how you identified this as a story and where the metadata came from.",
+                            "description": "One sentence: what this entry is and how you identified it.",
                         },
                     },
                     "required": [
-                        "title", "date", "author", "link",
-                        "body_starts_with", "body_ends_with",
+                        "content_type", "title", "date", "author", "organization",
+                        "link", "metadata", "body_starts_with", "body_ends_with",
                         "confidence", "reasoning",
                     ],
                 },
@@ -498,32 +941,41 @@ _NORMALIZE_TOOL = {
 
 _NORMALIZE_SYSTEM = (
     "You are a document parser for the Beat Book Builder, a tool that helps "
-    "journalists turn a collection of source articles into a reporting guide. "
-    "You receive a single document — extracted from any format (Word, PDF, "
-    "HTML, plain text, markdown, JSON, scraped web pages) — and you identify "
-    "the discrete news stories inside it.\n\n"
-    "Rules:\n"
-    "- One document may contain ZERO, ONE, or MANY stories. Split multi-story "
-    "documents using their natural boundaries (headings, separator lines, "
-    "byline blocks).\n"
-    "- For each story, extract title, date (YYYY-MM-DD or empty), author "
-    "(byline only, not publication name), and a source URL if present.\n"
-    "- body_starts_with: a VERBATIM 30-80 character snippet from the document "
-    "marking where this story's body begins. It must be the literal opening "
-    "text of the article body (the first sentence) — NOT the title, byline, "
-    "or any separator line above it.\n"
-    "- body_ends_with: a VERBATIM 30-80 character snippet from the document "
-    "marking where this story's body ends. It must be the last text of this "
-    "article before the next article (or end of document).\n"
-    "- The snippets must appear exactly in the document — character-for-"
-    "character. The server will locate them with a substring search, so "
-    "any paraphrasing or whitespace difference breaks the match.\n"
-    "- If the document is not news content (meeting notes, an invoice, raw "
-    "data, an empty file), set is_news_content=false, leave stories empty, "
-    "and put a short explanation in skip_reason.\n"
-    "- Do NOT rewrite or summarize content. The server uses your snippets "
-    "to slice the original text verbatim.\n"
-    "- You MUST call the register_stories tool. Do not respond with prose."
+    "journalists turn source materials into a reporting guide. "
+    "Source materials include news articles, datasets, government records, "
+    "legal orders, licenses, board minutes, reports, spreadsheets, "
+    "CSV files, JSON feeds, and any other journalism-relevant content.\n\n"
+    "STEP 1 — Identify what the document is.\n"
+    "Read enough to classify it: is this a news article? A legal order? "
+    "A license record? Meeting minutes? A dataset? A report?\n\n"
+    "STEP 2 — Extract entries appropriate to that type.\n"
+    "- One document may contain ZERO, ONE, or MANY entries.\n"
+    "- Split on natural boundaries: headings, byline blocks, record separators, sections.\n"
+    "- article: one entry per story. Title = headline. Body = article text.\n"
+    "- document (legal order/action): one entry per order. Title = the document's own title "
+    "(e.g. 'Order of Summary Suspension'). Date = order/effective date. "
+    "Metadata: docket_number, action_type, subject_name, jurisdiction.\n"
+    "- document (license): one entry per license record. "
+    "Metadata: license_number, license_status, state, expiry_date.\n"
+    "- dataset/tabular: one entry per logical table — NOT one per row. "
+    "Title describes the data. Body = full table text. "
+    "Metadata: fields, date_range, source_organization.\n"
+    "- report: one entry per document (or per major section for long reports). "
+    "Metadata: issuing_organization, report_number.\n"
+    "- transcript: one entry per meeting/session. Title = body + date. "
+    "Metadata: body_name, meeting_format, key_attendees.\n\n"
+    "STEP 3 — Fill in body markers.\n"
+    "- body_starts_with: VERBATIM 30-80 chars from the document marking the start of the body.\n"
+    "- body_ends_with: VERBATIM 30-80 chars marking the end.\n"
+    "- These are used for substring search — copy exactly, character for character.\n\n"
+    "STEP 4 — Fill organization vs author correctly.\n"
+    "- organization = the institution (publication, board, court, agency).\n"
+    "- author = the individual person (byline, signing official). Leave empty for "
+    "institutional documents.\n\n"
+    "Set is_news_content=false ONLY for files with zero journalistic value: "
+    "empty files, binary garbage, personal shopping lists, error pages.\n"
+    "Do NOT rewrite or summarize content — body text is sliced verbatim using your markers.\n"
+    "You MUST call the register_stories tool. Do not respond with prose."
 )
 
 
@@ -673,7 +1125,9 @@ def _normalize_chunk(
     source_label: str,
     anthropic_key: str,
     *,
+    model: str = NORMALIZE_MODEL,
     link_hint: str = "",
+    user_hint: str = "",
     allow_full_doc_fallback: bool = True,
 ) -> Tuple[list[Story], bool, str]:
     """Single LLM call on a chunk of text (which may be the whole document).
@@ -688,6 +1142,8 @@ def _normalize_chunk(
     user_prefix = f"Source label: {source_label}\n"
     if link_hint:
         user_prefix += f"Source URL: {link_hint}\n"
+    if user_hint:
+        user_prefix += f"Hint: {user_hint}\n"
     user_prefix += f"Text length (chars): {len(text)}\n\n"
     user_prefix += "----- BEGIN DOCUMENT -----\n"
     user_suffix = "\n----- END DOCUMENT -----"
@@ -702,16 +1158,21 @@ def _normalize_chunk(
             try:
                 # Extended thinking is incompatible with forced tool_choice,
                 # so we don't pass `thinking` here — omission == disabled.
-                resp = client.messages.create(
-                    model=NORMALIZE_MODEL,
-                    max_tokens=NORMALIZE_MAX_TOKENS,
-                    system=_NORMALIZE_SYSTEM,
-                    messages=[
-                        {"role": "user", "content": user_prefix + text + user_suffix},
-                    ],
-                    tools=[_NORMALIZE_TOOL],
-                    tool_choice={"type": "tool", "name": "register_stories"},
-                )
+                with ANTHROPIC_SEMAPHORE:
+                    resp = client.messages.create(
+                        model=model,
+                        max_tokens=NORMALIZE_MAX_TOKENS,
+                        system=[{
+                            "type": "text",
+                            "text": _NORMALIZE_SYSTEM,
+                            "cache_control": {"type": "ephemeral"},
+                        }],
+                        messages=[
+                            {"role": "user", "content": user_prefix + text + user_suffix},
+                        ],
+                        tools=[{**_NORMALIZE_TOOL, "cache_control": {"type": "ephemeral"}}],
+                        tool_choice={"type": "tool", "name": "register_stories"},
+                    )
                 break
             except anthropic.RateLimitError as e:
                 if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
@@ -719,12 +1180,12 @@ def _normalize_chunk(
                         f"{source_label}: rate limit not cleared after "
                         f"{RATE_LIMIT_MAX_RETRIES} retries — {e}"
                     ) from e
+                pause = rate_limit_pause(rl_attempt, e)
                 logger.warning(
-                    "Rate limited on %s; waiting %ds before retry %d/%d.",
-                    source_label, RATE_LIMIT_PAUSE_SECONDS,
-                    rl_attempt + 1, RATE_LIMIT_MAX_RETRIES,
+                    "Rate limited on %s; waiting %.0fs (attempt %d/%d).",
+                    source_label, pause, rl_attempt + 1, RATE_LIMIT_MAX_RETRIES,
                 )
-                time.sleep(RATE_LIMIT_PAUSE_SECONDS)
+                time.sleep(pause)
             except Exception as e:
                 raise IngestError(
                     f"{source_label}: LLM normalization failed — {type(e).__name__}: {e}"
@@ -751,64 +1212,62 @@ def _normalize_chunk(
         )
 
     payload = tool_use_block.input if isinstance(tool_use_block.input, dict) else {}
+    return _stories_from_payload(
+        payload, text, source_label, link_hint, allow_full_doc_fallback
+    )
 
+
+def _stories_from_payload(
+    payload: dict,
+    text: str,
+    source_label: str,
+    link_hint: str,
+    allow_full_doc_fallback: bool,
+) -> Tuple[list[Story], bool, str]:
+    """Convert a register_stories tool payload into Story objects.
+    Shared by both the Anthropic and OpenAI normalization paths."""
     is_news = bool(payload.get("is_news_content", False))
     skip_reason = (payload.get("skip_reason") or "").strip()
     raw_stories = payload.get("stories") or []
 
-    # Drop non-dict entries defensively — strict tool-use should prevent this
-    # but it's cheap insurance against a malformed input matching the schema.
-    dropped_malformed = sum(1 for r in raw_stories if not isinstance(r, dict))
-    if dropped_malformed:
-        logger.warning(
-            "Dropped %d non-dict entries from %s's stories array.",
-            dropped_malformed, source_label,
-        )
+    dropped = sum(1 for r in raw_stories if not isinstance(r, dict))
+    if dropped:
+        logger.warning("Dropped %d non-dict entries from %s's stories array.", dropped, source_label)
     raw_stories = [r for r in raw_stories if isinstance(r, dict)]
 
-    if not is_news or not raw_stories:
-        return [], False, skip_reason or "No news stories found in this document."
+    if not raw_stories:
+        return [], False, skip_reason or "No useful content found in this document."
 
     stories: list[Story] = []
     use_full_doc_fallback = allow_full_doc_fallback and len(raw_stories) == 1
 
-    # Pre-resolve every story's start position so each story's body can be
-    # capped at the next story's start. Without this cap, a missing or
-    # too-permissive end marker would silently extend the body into the
-    # next article — a bug that surfaced as bleed-through in saved beat
-    # books (e.g. a "council update" article whose body contained an
-    # adjacent "today in history" column).
-    start_positions: list[int] = []
-    for raw in raw_stories:
-        start_positions.append(
-            _resolve_marker_offset(text, raw.get("body_starts_with") or "")
-        )
+    start_positions: list[int] = [
+        _resolve_marker_offset(text, r.get("body_starts_with") or "")
+        for r in raw_stories
+    ]
     sorted_starts = sorted(s for s in start_positions if s >= 0)
 
     def _upper_bound_for(start: int) -> int:
-        # First sorted start strictly greater than this story's start.
         for s in sorted_starts:
             if s > start:
                 return s
         return len(text)
 
     for idx, raw in enumerate(raw_stories):
-        body_start = raw.get("body_starts_with") or ""
-        body_end = raw.get("body_ends_with") or ""
         start = start_positions[idx]
-        upper = _upper_bound_for(start) if start >= 0 else None
-
-        content = _slice_body(text, body_start, body_end, upper_bound=upper)
+        content = _slice_body(
+            text,
+            raw.get("body_starts_with") or "",
+            raw.get("body_ends_with") or "",
+            upper_bound=_upper_bound_for(start) if start >= 0 else None,
+        )
 
         if len(content) < 20 and use_full_doc_fallback:
-            logger.warning(
-                "Marker lookup for %s failed (got %d chars); falling back to full text.",
-                source_label, len(content),
-            )
+            logger.warning("Marker lookup for %s failed; falling back to full text.", source_label)
             content = text.strip()
 
         if not content:
-            logger.warning("Dropping story with empty body from %s.", source_label)
+            logger.warning("Dropping entry with empty body from %s.", source_label)
             continue
 
         title = (raw.get("title") or "").strip()
@@ -816,20 +1275,28 @@ def _normalize_chunk(
             first_line = next((ln for ln in content.splitlines() if ln.strip()), "")
             title = first_line[:80] if first_line else source_label
 
+        ct = (raw.get("content_type") or "article").strip().lower()
+        meta = raw.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
         stories.append(Story(
             title=title,
             content=content,
             date=(raw.get("date") or "").strip(),
             author=(raw.get("author") or "").strip(),
+            organization=(raw.get("organization") or "").strip(),
             link=(raw.get("link") or link_hint or "").strip(),
+            content_type=ct if ct in CONTENT_TYPES else "other",
+            metadata=meta,
             confidence=(raw.get("confidence") or "medium").strip(),
             reasoning=(raw.get("reasoning") or "").strip(),
         ))
 
     if not stories:
-        return [], False, skip_reason or "No story bodies could be extracted from this document."
-
+        return [], False, skip_reason or "No entry bodies could be extracted from this document."
     return stories, True, skip_reason
+
+
 
 
 def normalize(
@@ -837,24 +1304,37 @@ def normalize(
     source_label: str,
     anthropic_key: str,
     *,
+    model: str = NORMALIZE_MODEL,
+    concurrency: int = NORMALIZE_CONCURRENCY,
     link_hint: str = "",
+    user_hint: str = "",
+    on_progress: Optional[Callable[[dict], None]] = None,
 ) -> Tuple[list[Story], bool, str]:
-    """Stage 2. Run extracted text through Claude Sonnet 4.6 to produce
-    structured stories. Single LLM call for documents that fit in one window;
-    for larger documents, fan out into overlapping windows processed
-    concurrently and deduplicate on merge.
+    """Stage 2. Run extracted text through Haiku to produce structured entries.
+    Single call for documents that fit in one window; for larger documents fan
+    out into overlapping windows processed concurrently and deduplicate on merge.
 
     Returns (stories, is_news_content, skip_reason).
     """
+    def _chunk_fn(chunk_text: str, fallback: bool) -> Tuple[list[Story], bool, str]:
+        return _normalize_chunk(
+            chunk_text, source_label, anthropic_key,
+            model=model, link_hint=link_hint, user_hint=user_hint,
+            allow_full_doc_fallback=fallback,
+        )
+
     if not text or not text.strip():
         return [], False, "The document appears to be empty."
 
     if len(text) <= WINDOW_SIZE:
-        return _normalize_chunk(
-            text, source_label, anthropic_key,
-            link_hint=link_hint,
-            allow_full_doc_fallback=True,
-        )
+        if on_progress:
+            on_progress({
+                "stage": "normalize",
+                "detail": "Processing 1 of 1 chunk",
+                "completed": 1,
+                "total": 1,
+            })
+        return _chunk_fn(text, True)
 
     chunks = _make_chunks(text)
     truncated = len(chunks) > MAX_CHUNKS
@@ -866,27 +1346,33 @@ def normalize(
         source_label, len(chunks), len(text), WINDOW_SIZE, WINDOW_OVERLAP,
     )
 
-    # Run chunks concurrently. Failed chunks are logged and skipped; we only
-    # raise if every chunk fails.
     results: list[Optional[Tuple[list[Story], bool, str]]] = [None] * len(chunks)
+    completed = 0
+    completed_lock = threading.Lock()
 
     def _process(idx: int) -> Optional[Tuple[list[Story], bool, str]]:
-        if idx > 0:
-            time.sleep(INTER_CHUNK_PAUSE_SECONDS)
+        nonlocal completed
         try:
-            return _normalize_chunk(
-                chunks[idx], source_label, anthropic_key,
-                link_hint=link_hint,
-                allow_full_doc_fallback=False,
-            )
+            return _chunk_fn(chunks[idx], False)
         except IngestError as e:
             logger.warning(
                 "Chunk %d/%d failed for %s: %s",
                 idx + 1, len(chunks), source_label, e,
             )
             return None
+        finally:
+            if on_progress:
+                with completed_lock:
+                    completed += 1
+                    done = completed
+                on_progress({
+                    "stage": "normalize",
+                    "detail": f"Processed {done} of {len(chunks)} chunks",
+                    "completed": done,
+                    "total": len(chunks),
+                })
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=NORMALIZE_CONCURRENCY) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
         futures = {ex.submit(_process, i): i for i in range(len(chunks))}
         for fut in concurrent.futures.as_completed(futures):
             results[futures[fut]] = fut.result()
@@ -943,22 +1429,62 @@ def normalize(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def ingest_file(filename: str, raw: bytes, anthropic_key: str) -> IngestedSource:
+def ingest_file(
+    filename: str,
+    raw: bytes,
+    anthropic_key: str,
+    *,
+    on_progress: Optional[Callable[[dict], None]] = None,
+) -> IngestedSource:
     """Run both stages on an uploaded file. Never raises; failure is reported
     via excluded/skip_reason/extract_error on the returned IngestedSource."""
     source = IngestedSource(source_label=filename, kind="file")
 
+    # Fast path: structured JSON with explicit story fields skips the LLM.
+    if _ext_of(filename) == ".json":
+        fast = _fast_json_stories(raw, filename)
+        if fast is not None:
+            source.stories = fast
+            source.char_count = sum(len(s.content) for s in fast)
+            if on_progress:
+                on_progress({"stage": "done", "detail": "Structured JSON mapped without LLM"})
+            return source
+
+    # Build a filename-based type hint for PDFs and other documents so the LLM
+    # can prioritize the right metadata schema from the start.
+    is_pdf = _ext_of(filename) == ".pdf"
+    user_hint = ""
+    if is_pdf or _ext_of(filename) in (".doc", ".docx", ".rtf"):
+        inferred = _infer_content_type_from_filename(filename)
+        user_hint = f"Filename suggests this may be a '{inferred}'. Confirm and use the matching metadata fields."
+
     try:
+        if on_progress:
+            on_progress({"stage": "extract", "detail": "Extracting text"})
         text = extract_text(filename, raw)
     except IngestError as e:
-        source.excluded = True
-        source.extract_error = str(e)
-        source.skip_reason = "Failed to extract text from this file."
-        return source
+        if is_pdf and "__SCANNED_PDF__" in str(e):
+            # Fall back to OCR for scanned PDFs.
+            if on_progress:
+                on_progress({"stage": "extract", "detail": "Scanned PDF — running OCR"})
+            try:
+                text = _ocr_pdf(raw, anthropic_key, filename)
+                if user_hint:
+                    user_hint = "OCR transcription. " + user_hint
+                else:
+                    user_hint = "OCR transcription of a scanned PDF."
+            except IngestError as ocr_err:
+                source.excluded = True
+                source.extract_error = str(ocr_err)
+                source.skip_reason = str(ocr_err)
+                return source
+        else:
+            source.excluded = True
+            source.extract_error = str(e)
+            source.skip_reason = str(e)
+            return source
 
     source.char_count = len(text)
-    # Chunked normalization processes the whole text up to MAX_CHUNKS windows;
-    # anything beyond that is dropped at merge time.
     source.truncated = len(text) > MAX_CHUNKS * (WINDOW_SIZE - WINDOW_OVERLAP)
 
     if not text.strip():
@@ -967,7 +1493,11 @@ def ingest_file(filename: str, raw: bytes, anthropic_key: str) -> IngestedSource
         return source
 
     try:
-        stories, is_news, skip_reason = normalize(text, filename, anthropic_key)
+        stories, _, skip_reason = normalize(
+            text, filename, anthropic_key,
+            user_hint=user_hint,
+            on_progress=on_progress,
+        )
     except IngestError as e:
         source.excluded = True
         source.extract_error = str(e)
@@ -975,13 +1505,18 @@ def ingest_file(filename: str, raw: bytes, anthropic_key: str) -> IngestedSource
         return source
 
     source.stories = stories
-    if not is_news:
+    if not stories:
         source.excluded = True
-        source.skip_reason = skip_reason or "This document does not appear to contain news stories."
+        source.skip_reason = skip_reason or "No content entries could be extracted from this document."
     return source
 
 
-def ingest_url(url: str, anthropic_key: str) -> IngestedSource:
+def ingest_url(
+    url: str,
+    anthropic_key: str,
+    *,
+    on_progress: Optional[Callable[[dict], None]] = None,
+) -> IngestedSource:
     """Fetch a URL, then run both stages. Same failure semantics as ingest_file."""
     source = IngestedSource(source_label=url, kind="url")
 
@@ -994,16 +1529,16 @@ def ingest_url(url: str, anthropic_key: str) -> IngestedSource:
         return source
 
     try:
+        if on_progress:
+            on_progress({"stage": "extract", "detail": "Extracting text"})
         text = extract_text(filename, raw)
     except IngestError as e:
         source.excluded = True
         source.extract_error = str(e)
-        source.skip_reason = "Failed to extract text from the fetched URL."
+        source.skip_reason = str(e)
         return source
 
     source.char_count = len(text)
-    # Chunked normalization processes the whole text up to MAX_CHUNKS windows;
-    # anything beyond that is dropped at merge time.
     source.truncated = len(text) > MAX_CHUNKS * (WINDOW_SIZE - WINDOW_OVERLAP)
 
     if not text.strip():
@@ -1012,8 +1547,10 @@ def ingest_url(url: str, anthropic_key: str) -> IngestedSource:
         return source
 
     try:
-        stories, is_news, skip_reason = normalize(
-            text, url, anthropic_key, link_hint=url,
+        stories, _, skip_reason = normalize(
+            text, url, anthropic_key,
+            link_hint=url,
+            on_progress=on_progress,
         )
     except IngestError as e:
         source.excluded = True
@@ -1022,7 +1559,7 @@ def ingest_url(url: str, anthropic_key: str) -> IngestedSource:
         return source
 
     source.stories = stories
-    if not is_news:
+    if not stories:
         source.excluded = True
-        source.skip_reason = skip_reason or "This page does not appear to contain news stories."
+        source.skip_reason = skip_reason or "No content entries could be extracted from this page."
     return source

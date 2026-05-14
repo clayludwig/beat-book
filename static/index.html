@@ -7,7 +7,7 @@
   <title>Beat Book Builder</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap"
+  <link href="https://fonts.googleapis.com/css2?family=PT+Sans:wght@400;700&family=PT+Sans+Caption:wght@400;700&display=swap"
     rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -103,20 +103,28 @@
       </div>
     </div>
 
-    <!-- ── INTERVIEW SCREEN ─────────────────────────────────────── -->
-    <div id="interview-screen" class="screen">
+    <!-- ── TOPIC SELECT SCREEN ────────────────────────────────── -->
+    <div id="topic-screen" class="screen">
       <header class="app-header">
         <h2>Beat Book Builder</h2>
-        <div id="interview-session-info" class="session-info"></div>
+        <div id="topic-session-info" class="session-info"></div>
       </header>
       <div class="screen-body">
         <div class="screen-content">
           <div class="interview-heading">
-            <div class="eyebrow">Step 2 of 3 · Reporter interview</div>
-            <h1>A few quick questions</h1>
-            <p class="interview-lede">Your answers shape which angles the beat book emphasizes.</p>
+            <div class="eyebrow">Step 2 of 3 · Choose your focus</div>
+            <h1>What topics do you want to cover?</h1>
+            <p class="interview-lede">Select the topics to include in your beat book. The agent will focus only on what you pick.</p>
           </div>
-          <div id="interview-form-host"></div>
+          <div id="topic-list" class="topic-select-list"></div>
+          <div class="topic-select-actions">
+            <div class="topic-select-toggles">
+              <button id="topic-select-all" class="btn-link">Select all</button>
+              <span class="separator">·</span>
+              <button id="topic-deselect-all" class="btn-link">Deselect all</button>
+            </div>
+            <button id="topic-generate-btn" class="btn primary" disabled>Generate beat book</button>
+          </div>
         </div>
       </div>
     </div>

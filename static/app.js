@@ -30,8 +30,6 @@
     low:    document.getElementById("filter-count-low"),
   };
 
-  const interviewFormHost = document.getElementById("interview-form-host");
-
   const generatingLabel   = document.getElementById("generating-label");
   const generatingDetail  = document.getElementById("generating-detail");
   const generatingStats   = document.getElementById("generating-stats");
@@ -45,15 +43,40 @@
   const doneMarkdownLink = document.getElementById("done-markdown-link");
 
   const sessionInfoEls = document.querySelectorAll(
-    "#preview-session-info, #interview-session-info, #generating-session-info, #done-session-info"
+    "#preview-session-info, #generating-session-info, #done-session-info"
   );
+
+  // ── Content type vocabulary ──────────────────────────────────────────
+  const CONTENT_TYPES = [
+    { value: "article",       label: "Article" },
+    { value: "document",      label: "Document" },
+    { value: "dataset",       label: "Dataset" },
+    { value: "report",        label: "Report" },
+    { value: "transcript",    label: "Transcript" },
+    { value: "press_release", label: "Press Release" },
+    { value: "post",          label: "Post" },
+    { value: "other",         label: "Other" },
+  ];
+
+  function contentTypeLabel(value) {
+    return (CONTENT_TYPES.find(t => t.value === value) || { label: "Article" }).label;
+  }
 
   // ── State ────────────────────────────────────────────────────────────
   let selectedFiles = [];
   let previewState = [];      // [{source, stories:[{...editable, included}]}]
   let ws = null;
-  let activeInterview = null;
   const stats = { storiesRead: 0, searches: 0, topicsListed: 0 };
+  let working = false;
+
+  function setWorking(on) { working = on; }
+
+  window.addEventListener("beforeunload", (e) => {
+    if (working) {
+      e.preventDefault();
+      e.returnValue = "";
+    }
+  });
   // Visibility filter for the preview screen. Toggling a level off hides
   // those rows but does NOT change their `included` state — that stays
   // under user control via the per-row checkbox.
@@ -149,6 +172,7 @@
 
     if (selectedFiles.length === 0 && urls.length === 0) return;
 
+    setWorking(true);
     uploadBtn.disabled = true;
     uploadStatus.hidden = false;
     const totalSources = selectedFiles.length + urls.length;
@@ -160,23 +184,63 @@
     if (urls.length) form.append("urls", urls.join("\n"));
 
     try {
-      const resp = await fetch("/ingest", { method: "POST", body: form });
+      const resp = await fetch("/ingest/start", { method: "POST", body: form });
       const data = await resp.json();
 
       if (!resp.ok) {
         ingestStep.textContent = data.error || "Ingestion failed";
         ingestDetail.textContent = "";
         uploadBtn.disabled = false;
+        setWorking(false);
         return;
       }
 
-      renderPreview(data);
-      switchScreen("preview");
-      window.scrollTo({ top: 0 });
+      const jobId = data.job_id;
+      const es = new EventSource(`/ingest/stream/${jobId}`);
+
+      es.onmessage = (evt) => {
+        const msg = JSON.parse(evt.data || "{}");
+        if (msg.type === "job_started") {
+          ingestStep.textContent = `Reading ${msg.total_sources} ${msg.total_sources === 1 ? "source" : "sources"}…`;
+          ingestDetail.textContent = "Extracting text, then identifying stories with an LLM.";
+        } else if (msg.type === "source_started") {
+          ingestStep.textContent = `Processing ${msg.source_label}`;
+          ingestDetail.textContent = "";
+        } else if (msg.type === "source_progress") {
+          ingestStep.textContent = `Processing ${msg.source_label}`;
+          ingestDetail.textContent = msg.detail || "Working…";
+        } else if (msg.type === "source_done") {
+          const label = msg.excluded ? "Excluded" : "Entries";
+          ingestDetail.textContent = `${label}: ${msg.num_entries}`;
+        } else if (msg.type === "error") {
+          ingestStep.textContent = msg.error || "Ingestion failed";
+          ingestDetail.textContent = "";
+          es.close();
+          uploadBtn.disabled = false;
+          setWorking(false);
+          uploadStatus.hidden = true;
+        } else if (msg.type === "done") {
+          es.close();
+          renderPreview(msg);
+          switchScreen("preview");
+          window.scrollTo({ top: 0 });
+          setWorking(false);
+          uploadStatus.hidden = true;
+        }
+      };
+
+      es.onerror = () => {
+        ingestStep.textContent = "Ingestion connection lost.";
+        ingestDetail.textContent = "";
+        es.close();
+        uploadBtn.disabled = false;
+        setWorking(false);
+        uploadStatus.hidden = true;
+      };
     } catch (err) {
       ingestStep.textContent = `Ingestion failed: ${err.message}`;
       uploadBtn.disabled = false;
-    } finally {
+      setWorking(false);
       uploadStatus.hidden = true;
     }
   });
@@ -194,22 +258,25 @@
         title: s.title || "",
         date: s.date || "",
         author: s.author || "",
+        organization: s.organization || "",
         link: s.link || "",
         content: s.content || "",
+        content_type: s.content_type || "article",
+        metadata: s.metadata || {},
         confidence: s.confidence || "medium",
         reasoning: s.reasoning || "",
         included: true,
       })),
     }));
 
-    const totalStories = previewState.reduce((sum, src) => sum + src.stories.length, 0);
+    const totalItems = previewState.reduce((sum, src) => sum + src.stories.length, 0);
     const includedSources = previewState.filter(src => !src.excluded);
-    previewTitle.textContent = totalStories === 1
-      ? "We found 1 story"
-      : `We found ${totalStories} stories`;
+    previewTitle.textContent = totalItems === 1
+      ? "We found 1 item"
+      : `We found ${totalItems} items`;
     previewSummary.textContent =
       `From ${includedSources.length} ${includedSources.length === 1 ? "source" : "sources"}. ` +
-      "Review the metadata below, deselect anything you don't want, then run the pipeline.";
+      "Review and tag each item, deselect anything you don't want, then run the pipeline.";
 
     // Excluded sources
     const excluded = previewState.filter(src => src.excluded);
@@ -294,9 +361,22 @@
 
     const fields = document.createElement("div");
     fields.className = "preview-story-fields";
-    fields.appendChild(buildField("Title", "title", story.title, "title-input", srcIdx, storyIdx));
-    fields.appendChild(buildField("Date", "date", story.date, "", srcIdx, storyIdx, "YYYY-MM-DD"));
-    fields.appendChild(buildField("Author", "author", story.author, "", srcIdx, storyIdx, "Byline"));
+
+    // Row 1: title + type
+    const fieldsRow1 = document.createElement("div");
+    fieldsRow1.className = "preview-story-fields-row";
+    fieldsRow1.appendChild(buildField("Title", "title", story.title, "title-input", srcIdx, storyIdx));
+    fieldsRow1.appendChild(buildTypeSelect(srcIdx, storyIdx, story.content_type));
+    fields.appendChild(fieldsRow1);
+
+    // Row 2: organization + date + author
+    const fieldsRow2 = document.createElement("div");
+    fieldsRow2.className = "preview-story-fields-row";
+    fieldsRow2.appendChild(buildField("Organization", "organization", story.organization, "", srcIdx, storyIdx, "Issuing org / publication"));
+    fieldsRow2.appendChild(buildField("Date", "date", story.date, "", srcIdx, storyIdx, "YYYY-MM-DD"));
+    fieldsRow2.appendChild(buildField("Author", "author", story.author, "", srcIdx, storyIdx, "Byline / individual"));
+    fields.appendChild(fieldsRow2);
+
     topRow.appendChild(fields);
 
     row.appendChild(topRow);
@@ -309,7 +389,7 @@
     content.addEventListener("click", () => content.classList.toggle("expanded"));
     row.appendChild(content);
 
-    // Row 3: confidence + reasoning
+    // Row 3: confidence + reasoning + metadata chips
     const foot = document.createElement("div");
     foot.className = "preview-story-foot";
     const chip = document.createElement("span");
@@ -322,9 +402,40 @@
       reasoning.textContent = story.reasoning;
       foot.appendChild(reasoning);
     }
+    const meta = story.metadata || {};
+    const metaKeys = Object.keys(meta).filter(k => meta[k] !== null && meta[k] !== "");
+    if (metaKeys.length > 0) {
+      const metaRow = document.createElement("div");
+      metaRow.className = "preview-metadata-chips";
+      metaKeys.forEach(k => {
+        const pill = document.createElement("span");
+        pill.className = "metadata-chip";
+        const label = k.replace(/_/g, " ");
+        const val = Array.isArray(meta[k]) ? meta[k].join(", ") : String(meta[k]);
+        pill.textContent = `${label}: ${val}`;
+        metaRow.appendChild(pill);
+      });
+      foot.appendChild(metaRow);
+    }
     row.appendChild(foot);
 
     return row;
+  }
+
+  function buildTypeSelect(srcIdx, storyIdx, currentType) {
+    const sel = document.createElement("select");
+    sel.className = "type-select";
+    CONTENT_TYPES.forEach(({ value, label }) => {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = label;
+      if (value === currentType) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.addEventListener("change", () => {
+      previewState[srcIdx].stories[storyIdx].content_type = sel.value;
+    });
+    return sel;
   }
 
   function buildField(_label, key, value, extraClass, srcIdx, storyIdx, placeholder) {
@@ -344,7 +455,7 @@
       sum + src.stories.filter(s => s.included).length, 0);
     previewIncluded.textContent = total === 0
       ? "Nothing selected"
-      : `${total} ${total === 1 ? "story" : "stories"} selected`;
+      : `${total} ${total === 1 ? "item" : "items"} selected`;
     previewRunBtn.disabled = total === 0;
   }
 
@@ -420,12 +531,16 @@
           content: s.content,
           date: s.date,
           author: s.author,
+          organization: s.organization,
           link: s.link,
+          content_type: s.content_type || "article",
+          metadata: s.metadata || {},
         });
       }
     }
     if (stories.length === 0) return;
 
+    setWorking(true);
     previewRunBtn.disabled = true;
     previewBackBtn.disabled = true;
     previewStatus.hidden = false;
@@ -479,6 +594,7 @@
           }
 
           if (msg.type === "error") {
+            setWorking(false);
             previewProgressStep.textContent = "Pipeline failed";
             previewProgressDetail.textContent = msg.error || "";
             previewProgressBar.style.width = "0%";
@@ -488,6 +604,7 @@
         }
       }
     } catch (err) {
+      setWorking(false);
       previewProgressStep.textContent = `Pipeline failed: ${err.message}`;
       previewRunBtn.disabled = false;
       previewBackBtn.disabled = false;
@@ -553,18 +670,75 @@
     shimmerFill.style.width = "";
   }
 
-  // ── Start session: go to generating, open WebSocket ──────────────────
+  // ── Start session: show topic-select screen ───────────────────────────
   function startSession(uploadData) {
     const sessionText = `${uploadData.num_stories} stories · ${uploadData.num_topics} topics`;
     sessionInfoEls.forEach(el => { el.textContent = sessionText; });
+    document.getElementById("topic-session-info").textContent = sessionText;
+
+    // Render topic checkboxes from broad_topics map {label: count}
+    const list = document.getElementById("topic-list");
+    list.innerHTML = "";
+    const topics = uploadData.broad_topics || {};
+    Object.entries(topics)
+      .sort((a, b) => b[1] - a[1])
+      .forEach(([label, count]) => {
+        const item = document.createElement("label");
+        item.className = "topic-item selected";
+        item.innerHTML = `
+          <input type="checkbox" checked value="${label}">
+          <span class="topic-item-label">${label}</span>
+          <span class="topic-item-count">${count} ${count === 1 ? "story" : "stories"}</span>`;
+        item.querySelector("input").addEventListener("change", updateTopicBtn);
+        item.addEventListener("change", () => {
+          item.classList.toggle("selected", item.querySelector("input").checked);
+        });
+        list.appendChild(item);
+      });
+
+    updateTopicBtn();
+    switchScreen("topic");
+    window._pendingSession = uploadData;
+  }
+
+  function updateTopicBtn() {
+    const checked = document.querySelectorAll("#topic-list input:checked").length;
+    const btn = document.getElementById("topic-generate-btn");
+    btn.disabled = checked === 0;
+    btn.textContent = checked === 0
+      ? "Select at least one topic"
+      : `Generate beat book`;
+  }
+
+  document.getElementById("topic-select-all").addEventListener("click", () => {
+    document.querySelectorAll("#topic-list input").forEach(cb => {
+      cb.checked = true;
+      cb.closest(".topic-item").classList.add("selected");
+    });
+    updateTopicBtn();
+  });
+
+  document.getElementById("topic-deselect-all").addEventListener("click", () => {
+    document.querySelectorAll("#topic-list input").forEach(cb => {
+      cb.checked = false;
+      cb.closest(".topic-item").classList.remove("selected");
+    });
+    updateTopicBtn();
+  });
+
+  document.getElementById("topic-generate-btn").addEventListener("click", () => {
+    const selected = [...document.querySelectorAll("#topic-list input:checked")]
+      .map(cb => cb.value);
+    const uploadData = window._pendingSession;
+    if (!uploadData || selected.length === 0) return;
 
     setGenerating("Generating your beat book", "Reviewing your coverage…");
     setStage("review");
     setShimmerIndeterminate();
     startElapsed();
     switchScreen("generating");
-    startWebSocket(uploadData.session_id);
-  }
+    startWebSocket(uploadData.session_id, selected);
+  });
 
   // ── Generating screen helpers ────────────────────────────────────────
   function plural(n, single, multi) { return `${n} ${n === 1 ? single : multi}`; }
@@ -594,13 +768,15 @@
   }
 
   // ── WebSocket ────────────────────────────────────────────────────────
-  function startWebSocket(sessionId) {
+  function startWebSocket(sessionId, selectedTopics) {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     ws = new WebSocket(`${proto}://${location.host}/ws/${sessionId}`);
 
     ws.onopen = () => {
       setGenerating("Generating your beat book", "Reviewing your coverage…");
       setStage("review");
+      // Send selected topics immediately on connect
+      ws.send(JSON.stringify({ type: "select_topics", topics: selectedTopics }));
     };
 
     ws.onmessage = (evt) => {
@@ -608,6 +784,9 @@
 
       switch (msg.type) {
         case "message":
+          if (msg.text) {
+            setGenerating("Agent", msg.text);
+          }
           break;
 
         case "tool_status":
@@ -615,9 +794,13 @@
           setGenerating("Generating your beat book", formatToolDetail(msg));
           break;
 
-        case "questions":
-          showInterview(msg);
+        case "agent_progress": {
+          const pct = typeof msg.pct === "number" ? Math.max(0, Math.min(100, msg.pct)) : 0;
+          const label = msg.label || "Reviewing coverage";
+          setGenerating(`${label} — ${pct}%`, "");
+          setShimmerDeterminate(pct / 100);
           break;
+        }
 
         case "research_started":
           setGenerating("Researching context", "Opening the sandbox for the research agent…");
@@ -656,10 +839,12 @@
         }
 
         case "beat_book":
+          setWorking(false);
           showDone(msg);
           break;
 
         case "error":
+          setWorking(false);
           setGenerating("Something went wrong", msg.text || "Please try again.");
           setShimmerIndeterminate();
           break;
@@ -672,126 +857,6 @@
   function formatToolDetail(msg) {
     if (msg.detail) return `${msg.tool} — ${msg.detail}`;
     return msg.tool || "";
-  }
-
-  // ── Interview rendering ──────────────────────────────────────────────
-  function showInterview(msg) {
-    activeInterview = {
-      intro: msg.intro || "",
-      questions: msg.questions || [],
-    };
-
-    interviewFormHost.innerHTML = "";
-
-    const form = document.createElement("div");
-    form.className = "interview-form";
-
-    const collectors = [];
-
-    activeInterview.questions.forEach((q, i) => {
-      const block = document.createElement("div");
-      block.className = "question-block";
-
-      const num = document.createElement("div");
-      num.className = "question-num";
-      num.textContent = `Question ${i + 1} of ${activeInterview.questions.length}`;
-      block.appendChild(num);
-
-      const qText = document.createElement("div");
-      qText.className = "question-text";
-      qText.textContent = q.question;
-      block.appendChild(qText);
-
-      const type = q.question_type;
-      const options = q.options || [];
-
-      if (type === "free_response") {
-        const ta = document.createElement("textarea");
-        ta.className = "free-text";
-        ta.placeholder = "Type your answer…";
-        block.appendChild(ta);
-        collectors.push(() => ta.value.trim());
-      } else {
-        const inputType = type === "single_choice" ? "radio" : "checkbox";
-        const list = document.createElement("div");
-        list.className = "option-list";
-
-        options.forEach((opt, j) => {
-          const item = document.createElement("label");
-          item.className = "option-item";
-          const id = `q${i}-opt${j}`;
-          item.htmlFor = id;
-
-          const input = document.createElement("input");
-          input.type = inputType;
-          input.name = `q${i}-option`;
-          input.value = opt;
-          input.id = id;
-
-          const span = document.createElement("span");
-          span.textContent = opt;
-
-          item.appendChild(input);
-          item.appendChild(span);
-
-          input.addEventListener("change", () => {
-            if (inputType === "radio") {
-              list.querySelectorAll(".option-item").forEach(el => el.classList.remove("checked"));
-            }
-            item.classList.toggle("checked", input.checked);
-          });
-
-          list.appendChild(item);
-        });
-
-        block.appendChild(list);
-        collectors.push(() =>
-          [...list.querySelectorAll("input:checked")].map(el => el.value)
-        );
-      }
-
-      form.appendChild(block);
-    });
-
-    const row = document.createElement("div");
-    row.className = "submit-row";
-
-    const hint = document.createElement("span");
-    hint.className = "submit-hint";
-    hint.textContent = `${activeInterview.questions.length} question${activeInterview.questions.length === 1 ? "" : "s"}`;
-    row.appendChild(hint);
-
-    const submitBtn = document.createElement("button");
-    submitBtn.className = "btn primary";
-    submitBtn.textContent = "Submit answers";
-    submitBtn.addEventListener("click", () => {
-      const answers = activeInterview.questions.map((q, i) => ({
-        question: q.question,
-        answer: collectors[i](),
-      }));
-      submitInterview(answers);
-    });
-    row.appendChild(submitBtn);
-
-    form.appendChild(row);
-    interviewFormHost.appendChild(form);
-
-    switchScreen("interview");
-    window.scrollTo({ top: 0 });
-  }
-
-  function submitInterview(answers) {
-    activeInterview = null;
-    interviewFormHost.innerHTML = "";
-
-    setGenerating("Writing your beat book", "Processing your answers…");
-    setStage("write");
-    setShimmerIndeterminate();
-    switchScreen("generating");
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ answers }));
-    }
   }
 
   // ── Done screen ──────────────────────────────────────────────────────

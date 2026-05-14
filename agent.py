@@ -2,12 +2,7 @@
 agent.py
 --------
 Claude-powered agent (Sonnet 4.6) that has tools to explore stories/
-topics and interview the reporter, then produces a beat book.
-
-The agent runs in an async loop.  Most tools execute locally, but
-`interview_user` pauses execution and sends the question to the frontend
-via a callback.  The callback returns the user's answer so the loop can
-resume.
+topics and produces a beat book without an interview stage.
 """
 
 import asyncio
@@ -20,9 +15,8 @@ from pipeline import PipelineResult
 from claude_client import (
     CHAT_MODEL,
     RATE_LIMIT_MAX_RETRIES,
-    RATE_LIMIT_PAUSE_SECONDS,
     chat_client,
-    thinking_param,
+    rate_limit_pause,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -30,11 +24,25 @@ from claude_client import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 AGENT_MODEL = CHAT_MODEL
+# Exploration (deciding which topics/stories to look at) is mechanical and
+# uses Haiku for ~5-10x faster turns. The final beat-book write switches
+# back to Sonnet for prose quality.
+EXPLORE_MODEL = "claude-haiku-4-5-20251001"
 
 # Generous output cap — beat books can be long. Sonnet 4.6 supports a
 # 1M token context window and up to 128k output tokens; 32k per turn is
 # plenty for a beat-book draft plus a few tool calls.
 MAX_TOKENS_PER_TURN = 32768
+# Tighter cap for the forced final generation turn — keeps Sonnet from
+# spending 5+ minutes filling the buffer. A beat book is ~5-10k words,
+# which is comfortably under 16k tokens of output.
+MAX_TOKENS_FINAL_GENERATE = 16384
+# Hard cap on any single tool result sent back to the model. Prevents one
+# large read_stories_in_topic call from flooding the context.
+MAX_TOOL_RESULT_CHARS = 60_000
+# When the conversation exceeds this many messages, old tool result turns
+# are replaced with a stub so the history stays within the 1M token limit.
+MAX_HISTORY_MESSAGES = 40
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOL DEFINITIONS (Anthropic tool-use schema)
@@ -89,6 +97,27 @@ TOOLS = [
         },
     },
     {
+        "name": "read_stories_in_topic",
+        "description": (
+            "Read all stories in a topic at once — title, metadata, and a "
+            "content excerpt for every story in the topic in a single call. "
+            "Use this as your primary research tool: it satisfies the research "
+            "requirement for the topic in one call instead of N separate "
+            "read_story calls. After scanning, use read_story only if you need "
+            "the full text of a specific document."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "The exact topic label to scan.",
+                },
+            },
+            "required": ["topic"],
+        },
+    },
+    {
         "name": "search_stories",
         "description": (
             "Search stories by keyword. Returns matching story indices, titles, "
@@ -103,56 +132,6 @@ TOOLS = [
                 },
             },
             "required": ["query"],
-        },
-    },
-    {
-        "name": "interview_user",
-        "description": (
-            "Ask the reporter a BATCH of interview questions in a single form. "
-            "The reporter fills out all questions at once and submits. Strongly "
-            "prefer asking 3–6 related questions in one call over many separate "
-            "calls — it gives the reporter context for what you're trying to "
-            "learn and avoids a tedious back-and-forth. Only call this tool a "
-            "second time if a follow-up is genuinely necessary based on their "
-            "first answers.\n\n"
-            "Each question supports one of four input types:\n"
-            "- 'checklist': multi-select checkboxes (use for 'select all that apply')\n"
-            "- 'single_choice': radio buttons — pick exactly one\n"
-            "- 'multiple_choice': checkboxes — pick one or more\n"
-            "- 'free_response': open text input\n"
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "intro": {
-                    "type": "string",
-                    "description": "Optional 1–2 sentence intro shown above the form to frame what you're asking and why.",
-                },
-                "questions": {
-                    "type": "array",
-                    "description": "Ordered list of questions to present in one form (3–6 recommended).",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question": {
-                                "type": "string",
-                                "description": "The question text.",
-                            },
-                            "question_type": {
-                                "type": "string",
-                                "enum": ["checklist", "single_choice", "multiple_choice", "free_response"],
-                            },
-                            "options": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Options for checklist / single_choice / multiple_choice. Leave empty for free_response.",
-                            },
-                        },
-                        "required": ["question", "question_type"],
-                    },
-                },
-            },
-            "required": ["questions"],
         },
     },
     {
@@ -193,31 +172,15 @@ You have been given a set of news stories that the reporter has uploaded. These 
 stories have already been analyzed and grouped into topics automatically.
 
 Your workflow:
-1. **Explore** — Start by using `view_topics` to see what topics exist in the \
-stories. Read a few representative stories to understand the coverage.
-2. **Interview** — Call `interview_user` ONCE with a batch of 4–6 questions. \
-Include a short `intro` framing what you're trying to learn. Start the batch \
-with a checklist of the discovered topics so they can select which form their \
-beat, then add questions about audience, experience level, and what they need \
-most from the guide. Only call `interview_user` a second time if a follow-up \
-is truly essential based on their answers.
-3. **Research thoroughly** — This is the longest step, and the quality of \
-the beat book is directly proportional to how much of the corpus you have \
-actually read. For each topic the reporter selected, call \
-`list_stories_in_topic` first to see what is there, then read a substantial \
-sample. At minimum, read half the stories in every selected topic; when a \
-topic has fewer than 15 stories, read every one. Use `search_stories` to \
-surface specific people, institutions, and themes once you start noticing \
-patterns. Every `list_stories_in_topic` / `read_story` / `search_stories` \
-tool result includes a `[Research progress]` block that tells you, per \
-topic, how many stories you've read out of the target — use it to track \
-where you still need depth. The system will refuse `generate_beat_book` \
-calls until every listed topic has met its target, so do not bother trying \
-to short-circuit; just keep reading.
-4. **Generate** — Once every listed topic shows "OK" in the progress block, \
-call `generate_beat_book` with a polished Markdown document. You have a \
-40-turn budget — using most of it on research is the expected behavior, \
-not a problem.
+1. **Explore** — Call `view_topics` to see the full topic list. Then call \
+`read_stories_in_topic` for each topic — it returns every story with a \
+2000-character excerpt and immediately satisfies the research requirement for \
+that topic. Use `read_story` only when you need the full text of a specific \
+document. Use `search_stories` to surface specific people, institutions, or \
+themes across topics. Every tool result includes a `[Research progress]` block \
+showing per-topic read status — once all topics show "OK", you can generate.
+2. **Generate** — Call `generate_beat_book` once every topic shows "OK" in \
+the progress block.
 
 The beat book is a narrative document, not an outline. A reporter should be \
 able to read it cover-to-cover the way they'd read a long-form magazine \
@@ -339,8 +302,30 @@ def execute_local_tool(name: str, input_data: dict, result: PipelineResult) -> s
             "author": story.get("author", ""),
             "date": story.get("date", ""),
             "topics": result.story_topics[input_data["index"]],
-            "content": story.get("content", "")[:3000],
+            "content": story.get("content", "")[:1500],
         }, indent=2)
+
+    if name == "read_stories_in_topic":
+        topic = input_data.get("topic", "")
+        indices = result.topics.get(topic, [])
+        if not indices:
+            return f"No stories found for topic '{topic}'. Check exact spelling."
+        entries = []
+        for i in indices:
+            story = result.get_story(i)
+            if not story:
+                continue
+            entries.append({
+                "index": i,
+                "title": story.get("title", ""),
+                "date": story.get("date", ""),
+                "author": story.get("author", ""),
+                "organization": story.get("organization", ""),
+                "content_type": story.get("content_type", "article"),
+                "metadata": story.get("metadata", {}),
+                "excerpt": story.get("content", "")[:600],
+            })
+        return json.dumps(entries, indent=2)
 
     if name == "search_stories":
         matches = result.search_stories(input_data["query"])
@@ -355,8 +340,6 @@ def execute_local_tool(name: str, input_data: dict, result: PipelineResult) -> s
 # AGENT LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Type for the callback that sends questions to the frontend and gets answers
-InterviewCallback = Callable[[dict], Awaitable[str]]
 # Type for the callback that sends agent text messages to the frontend
 MessageCallback   = Callable[[str], Awaitable[None]]
 # Type for the callback that reports tool execution status
@@ -367,20 +350,59 @@ ToolStatusCallback = Callable[[str, str, str], Awaitable[None]]
 TOOL_DESCRIPTIONS = {
     "view_topics": "Reviewing discovered topics",
     "list_stories_in_topic": "Listing stories in topic",
+    "read_stories_in_topic": "Scanning all stories in topic",
     "read_story": "Reading a story",
     "search_stories": "Searching stories",
-    "interview_user": "Asking you a question",
     "generate_beat_book": "Writing the beat book",
 }
+
+
+def _cap_tool_result(content: str) -> str:
+    if len(content) <= MAX_TOOL_RESULT_CHARS:
+        return content
+    return content[:MAX_TOOL_RESULT_CHARS] + (
+        f"\n\n[Truncated: result was {len(content):,} chars; "
+        f"showing first {MAX_TOOL_RESULT_CHARS:,}. "
+        "Use read_story with specific indices for full content.]"
+    )
+
+
+def _prune_history(messages: list) -> list:
+    """Replace the content of old tool-result turns with a stub once the
+    conversation grows past MAX_HISTORY_MESSAGES, keeping the most recent
+    turns intact so the model retains full context of recent work."""
+    if len(messages) <= MAX_HISTORY_MESSAGES:
+        return messages
+    # Keep the first message (initial user prompt) and the most recent half.
+    keep_tail = MAX_HISTORY_MESSAGES // 2
+    pruned = []
+    for i, msg in enumerate(messages):
+        if i == 0 or i >= len(messages) - keep_tail:
+            pruned.append(msg)
+        elif msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            # Replace tool result content with stubs to free token budget.
+            stubbed = []
+            for block in msg["content"]:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    stubbed.append({**block, "content": "[earlier result omitted to save context]"})
+                else:
+                    stubbed.append(block)
+            pruned.append({**msg, "content": stubbed})
+        else:
+            pruned.append(msg)
+    return pruned
 
 
 async def run_agent(
     pipeline_result: PipelineResult,
     anthropic_key: str,
-    on_interview: InterviewCallback,
     on_message: MessageCallback,
     on_beat_book: Callable[[str, str], Awaitable[None]],
     on_tool_status: ToolStatusCallback = None,
+    on_heartbeat: Callable[[], Awaitable[None]] = None,
+    on_agent_progress: Callable[[float, str], Awaitable[None]] = None,
+    on_exploration_done: Callable[[str], Awaitable[None]] = None,
+    selected_topics: list[str] | None = None,
 ) -> None:
     """
     Run the agent loop.
@@ -388,12 +410,80 @@ async def run_agent(
     Args:
         pipeline_result: Output from the embedding/clustering pipeline.
         anthropic_key: Anthropic API key (claude-sonnet-4-6).
-        on_interview: async callback(question_data) → user's answer string.
         on_message: async callback(text) — sends agent text to the frontend.
         on_beat_book: async callback(filename, markdown) — saves/delivers the beat book.
         on_tool_status: async callback(tool_name, detail) — reports tool execution status.
+        on_heartbeat: optional async callback fired every ~15s during API calls
+                      to keep the WebSocket connection alive.
     """
     client = chat_client(anthropic_key)
+
+    def _streamed_create(**kwargs):
+        """Blocking streaming call. Using `messages.stream` instead of
+        `messages.create` keeps the HTTP connection alive while Sonnet
+        writes long output; the non-streaming endpoint silently disconnects
+        on multi-minute responses (RemoteProtocolError)."""
+        import time as _t
+        t0 = _t.time()
+        print(f"[agent.stream] entering stream context, model={kwargs.get('model')}, "
+              f"max_tokens={kwargs.get('max_tokens')}", flush=True)
+        chars = 0
+        events = 0
+        last_print = t0
+        try:
+            stream_ctx = client.messages.stream(**kwargs)
+        except Exception as e:
+            print(f"[agent.stream] stream() raised before entering: {type(e).__name__}: {e}",
+                  flush=True)
+            raise
+        with stream_ctx as stream:
+            print(f"[agent.stream] context open at {_t.time()-t0:.1f}s, "
+                  f"iterating events…", flush=True)
+            for event in stream:
+                events += 1
+                if events == 1:
+                    print(f"[agent.stream] first event at {_t.time()-t0:.1f}s "
+                          f"type={type(event).__name__}", flush=True)
+                delta = getattr(event, "delta", None)
+                if delta is not None:
+                    text = getattr(delta, "text", None) or getattr(delta, "partial_json", None)
+                    if text:
+                        chars += len(text)
+                now = _t.time()
+                if now - last_print >= 5:
+                    print(f"[agent.stream] {now-t0:.1f}s, {events} events, "
+                          f"{chars} chars streamed", flush=True)
+                    last_print = now
+            final = stream.get_final_message()
+        print(f"[agent.stream] done in {_t.time()-t0:.1f}s, "
+              f"{events} events, stop_reason={final.stop_reason}", flush=True)
+        return final
+
+    async def _api_call_with_heartbeat(**kwargs):
+        """Run the streaming API call in a thread while sending heartbeats
+        every 15 seconds so the WebSocket doesn't time out during long turns."""
+        api_task = asyncio.create_task(asyncio.to_thread(_streamed_create, **kwargs))
+        while not api_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(api_task), timeout=15)
+            except asyncio.TimeoutError:
+                if on_heartbeat:
+                    try:
+                        await on_heartbeat()
+                    except Exception:
+                        pass
+            except Exception:
+                # surface the real exception from api_task below
+                break
+        return await api_task
+
+    # Restrict to reporter-selected topics if provided.
+    if selected_topics:
+        from pipeline import PipelineResult as _PR
+        from dataclasses import replace as _replace
+        filtered = {t: v for t, v in pipeline_result.topics.items()
+                    if t in set(selected_topics)}
+        pipeline_result = _replace(pipeline_result, topics=filtered)
 
     n_stories = len(pipeline_result.stories)
     n_topics  = len(pipeline_result.topics)
@@ -404,9 +494,9 @@ async def run_agent(
             "role": "user",
             "content": (
                 f"I've uploaded {n_stories} news stories. The system has automatically "
-                f"discovered {n_topics} topics across them. Please help me build a "
-                "beat book from these stories. Start by exploring the topics, then "
-                "interview me to understand my beat."
+                f"discovered {n_topics} topics across them. Please build a comprehensive "
+                "beat book from these stories. Start by exploring the topics, read all "
+                "of them, then generate the beat book."
             ),
         },
     ]
@@ -422,10 +512,52 @@ async def run_agent(
     listed_topics: set = set()
     read_indices: set = set()
 
-    thinking_cfg = thinking_param()
-
     MAX_TURNS = 40
     for _turn in range(MAX_TURNS):
+        messages = _prune_history(messages)
+
+        # Once coverage is met, FORCE the model to call generate_beat_book.
+        # Without forced tool_choice, Sonnet often narrates "I've reviewed
+        # everything" and ends the turn instead of producing the book.
+        _, threshold_met = _progress_report(
+            pipeline_result, listed_topics, read_indices,
+        )
+        force_generate = threshold_met and not beat_book_done
+        if force_generate and on_exploration_done and not getattr(run_agent, "_exploration_fired", False):
+            run_agent._exploration_fired = True
+            # Build a context doc with topic summaries + story excerpts for
+            # the research agent to start on in parallel.
+            context_lines = ["# Beat Book Research Context\n"]
+            for topic, indices in pipeline_result.topics.items():
+                context_lines.append(f"## {topic}\n")
+                for i in list(indices)[:6]:
+                    s = pipeline_result.get_story(i)
+                    if s:
+                        excerpt = " ".join(s.get("content", "").split()[:60])
+                        context_lines.append(f"- **{s.get('title','')}** — {excerpt}\n")
+                context_lines.append("")
+            context_doc = "\n".join(context_lines)
+            try:
+                await on_exploration_done(context_doc)
+            except Exception:
+                pass
+        if force_generate:
+            print(f"[agent] turn {_turn}: forcing generate_beat_book "
+                  f"(listed={len(listed_topics)}/{len(pipeline_result.topics)}, "
+                  f"read={len(read_indices)}/{len(pipeline_result.stories)})",
+                  flush=True)
+            if on_tool_status:
+                await on_tool_status(
+                    "generate_beat_book",
+                    "Writing the beat book",
+                    "Drafting the full Markdown — this takes 1–3 minutes…",
+                )
+            if on_agent_progress:
+                await on_agent_progress(100, "Writing the beat book")
+            await on_message(
+                "Coverage target met — writing the beat book now. "
+                "This step takes 1–3 minutes."
+            )
         # SDK blocks the event loop; offload to a worker thread so the
         # WebSocket handler stays responsive. If the SDK exhausts its own
         # 429-retry budget, the outer loop here pauses and tries again
@@ -433,17 +565,53 @@ async def run_agent(
         response = None
         for rl_attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
             try:
-                response = await asyncio.to_thread(
-                    client.messages.create,
-                    model=AGENT_MODEL,
-                    max_tokens=MAX_TOKENS_PER_TURN,
-                    system=SYSTEM_PROMPT,
-                    tools=TOOLS,
-                    messages=messages,
-                    thinking=thinking_cfg,
-                )
+                if force_generate:
+                    # Final-write strategy: no tools at all, no tool_choice.
+                    # The model emits the beat book as plain Markdown text,
+                    # which streams reliably (forcing a tool_use that
+                    # contains 16k tokens of stringified JSON hangs at TTFT
+                    # for both Sonnet and Haiku — confirmed empirically).
+                    write_messages = list(messages) + [{
+                        "role": "user",
+                        "content": (
+                            "Now write the full beat book in Markdown. "
+                            "Reply with ONLY the Markdown document — no "
+                            "preamble, no acknowledgement. Start directly "
+                            "with the title (`# ...`)."
+                        ),
+                    }]
+                    request_kwargs = dict(
+                        model=EXPLORE_MODEL,
+                        max_tokens=MAX_TOKENS_FINAL_GENERATE,
+                        system=[{
+                            "type": "text",
+                            "text": SYSTEM_PROMPT,
+                            "cache_control": {"type": "ephemeral"},
+                        }],
+                        messages=write_messages,
+                    )
+                else:
+                    request_kwargs = dict(
+                        model=EXPLORE_MODEL,
+                        max_tokens=4096,
+                        system=[{
+                            "type": "text",
+                            "text": SYSTEM_PROMPT,
+                            "cache_control": {"type": "ephemeral"},
+                        }],
+                        tools=TOOLS,
+                        messages=messages,
+                    )
+                print(f"[agent] turn {_turn}: calling Sonnet "
+                      f"(force_generate={force_generate}, "
+                      f"max_tokens={request_kwargs['max_tokens']}, "
+                      f"messages={len(messages)})", flush=True)
+                response = await _api_call_with_heartbeat(**request_kwargs)
+                print(f"[agent] turn {_turn}: stop_reason={response.stop_reason} "
+                      f"blocks={[getattr(b,'type',None) for b in response.content]}",
+                      flush=True)
                 break
-            except anthropic.RateLimitError:
+            except anthropic.RateLimitError as e:
                 if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
                     await on_message(
                         "⚠️ Anthropic's concurrent-connection rate limit "
@@ -451,12 +619,39 @@ async def run_agent(
                         "minutes and start a new session."
                     )
                     return
+                pause = rate_limit_pause(rl_attempt, e)
                 await on_message(
-                    f"⏸ Hit Anthropic's concurrent-connection rate limit. "
-                    f"Waiting {RATE_LIMIT_PAUSE_SECONDS}s before retrying "
+                    f"⏸ Hit Anthropic's rate limit. "
+                    f"Waiting {pause:.0f}s before retrying "
                     f"(attempt {rl_attempt + 1}/{RATE_LIMIT_MAX_RETRIES})…"
                 )
-                await asyncio.sleep(RATE_LIMIT_PAUSE_SECONDS)
+                await asyncio.sleep(pause)
+            except (anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
+                if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
+                    await on_message(
+                        f"⚠️ Connection to Anthropic kept failing ({e}). "
+                        "Please check your network and start a new session."
+                    )
+                    return
+                pause = min(30.0, 5.0 * (2 ** rl_attempt))
+                await on_message(
+                    f"⏸ Connection error talking to Anthropic ({e}). "
+                    f"Retrying in {pause:.0f}s "
+                    f"(attempt {rl_attempt + 1}/{RATE_LIMIT_MAX_RETRIES})…"
+                )
+                await asyncio.sleep(pause)
+            except anthropic.APIStatusError as e:
+                status = getattr(e, "status_code", None)
+                if status and 500 <= status < 600 and rl_attempt < RATE_LIMIT_MAX_RETRIES:
+                    pause = min(30.0, 5.0 * (2 ** rl_attempt))
+                    await on_message(
+                        f"⏸ Anthropic returned {status}. Retrying in "
+                        f"{pause:.0f}s (attempt {rl_attempt + 1}/"
+                        f"{RATE_LIMIT_MAX_RETRIES})…"
+                    )
+                    await asyncio.sleep(pause)
+                else:
+                    raise
         assert response is not None  # loop above either sets or returns
 
         # Forward any plain-text narration to the frontend (dedup repeats).
@@ -464,6 +659,20 @@ async def run_agent(
             b.text for b in response.content
             if getattr(b, "type", None) == "text"
         ).strip()
+
+        if force_generate:
+            # Final-write turn: the text body IS the beat book.
+            if text_combined:
+                await on_beat_book("beat_book.md", text_combined)
+                beat_book_done = True
+                break
+            else:
+                await on_message(
+                    "⚠️ The model returned no Markdown on the final write. "
+                    "Try again."
+                )
+                break
+
         if text_combined and text_combined != last_message_text:
             await on_message(text_combined)
             last_message_text = text_combined
@@ -478,7 +687,30 @@ async def run_agent(
                     "⚠️ The model hit its output limit mid-turn. The beat book "
                     "may be incomplete. Please try again with a tighter scope."
                 )
-            break
+                break
+            if beat_book_done:
+                break
+            # Agent stopped narrating without calling generate_beat_book.
+            # Push it forward instead of silently dropping the session.
+            _, threshold_met = _progress_report(
+                pipeline_result, listed_topics, read_indices,
+            )
+            messages.append({"role": "assistant", "content": response.content})
+            if threshold_met:
+                nudge = (
+                    "You have met the coverage target on every listed topic. "
+                    "Call `generate_beat_book` NOW with the full Markdown. "
+                    "Do not reply with text — call the tool."
+                )
+            else:
+                nudge = (
+                    "You stopped without calling a tool. Continue exploring: "
+                    "use `read_stories_in_topic` on topics that still show "
+                    "'needs more', then call `generate_beat_book`. Do not "
+                    "reply with prose — call a tool."
+                )
+            messages.append({"role": "user", "content": nudge})
+            continue
         if beat_book_done:
             break
 
@@ -499,7 +731,7 @@ async def run_agent(
             if on_tool_status:
                 desc = TOOL_DESCRIPTIONS.get(tool_name, tool_name)
                 detail = ""
-                if tool_name == "list_stories_in_topic":
+                if tool_name in ("list_stories_in_topic", "read_stories_in_topic"):
                     detail = tool_input.get("topic", "")
                 elif tool_name == "read_story":
                     idx = tool_input.get("index", "")
@@ -509,11 +741,7 @@ async def run_agent(
                     detail = tool_input.get("query", "")
                 await on_tool_status(tool_name, desc, detail)
 
-            if tool_name == "interview_user":
-                answer = await on_interview(tool_input)
-                content_str = f"Reporter's answer: {answer}"
-
-            elif tool_name == "generate_beat_book":
+            if tool_name == "generate_beat_book":
                 progress, threshold_met = _progress_report(
                     pipeline_result, listed_topics, read_indices,
                 )
@@ -543,6 +771,11 @@ async def run_agent(
                     topic = tool_input.get("topic", "")
                     if topic and topic in pipeline_result.topics:
                         listed_topics.add(topic)
+                elif tool_name == "read_stories_in_topic":
+                    topic = tool_input.get("topic", "")
+                    if topic and topic in pipeline_result.topics:
+                        listed_topics.add(topic)
+                        read_indices.update(pipeline_result.topics[topic])
                 elif tool_name == "read_story":
                     idx = tool_input.get("index")
                     if isinstance(idx, int) and 0 <= idx < len(pipeline_result.stories):
@@ -552,14 +785,36 @@ async def run_agent(
                 )
                 content_str = f"{content_str}\n\n{progress}"
 
+                if on_agent_progress:
+                    total_topics = len(pipeline_result.topics) or 1
+                    topic_pct = 0.0
+                    for topic, indices in pipeline_result.topics.items():
+                        if not indices:
+                            continue
+                        target = _target_for_topic(len(indices))
+                        read = sum(1 for i in indices if i in read_indices)
+                        topic_pct += min(1.0, read / target) / total_topics
+                    pct = round(topic_pct * 100)
+                    label = f"Reviewing coverage — {len(listed_topics)}/{total_topics} topics"
+                    try:
+                        await on_agent_progress(pct, label)
+                    except Exception:
+                        pass
+
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": tool_id,
-                "content": content_str,
+                "content": _cap_tool_result(content_str),
             })
 
         if tool_results:
             messages.append({"role": "user", "content": tool_results})
 
     if not beat_book_done:
-        await on_message("✅ Agent session complete.")
+        print(f"[agent] loop exited without writing beat book "
+              f"(turn count exhausted or stop_reason mismatch). "
+              f"listed_topics={listed_topics}, read={len(read_indices)}", flush=True)
+        await on_message(
+            "⚠️ Agent stopped before producing a beat book. "
+            "Try again, or check the server logs."
+        )

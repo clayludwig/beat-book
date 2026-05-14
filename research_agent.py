@@ -33,19 +33,19 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from anthropic import Anthropic
 
-from claude_client import thinking_enabled
+from claude_client import thinking_enabled, thinking_param
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
 MODEL = "claude-opus-4-7"
-MAX_TOKENS_PER_TURN = 32000
-MAX_TURNS = 30
-BASH_TIMEOUT_SECONDS = 60
-WEB_SEARCH_MAX_USES = 20
-WEB_FETCH_MAX_USES = 20
-WEB_FETCH_MAX_CONTENT_TOKENS = 50_000
+MAX_TOKENS_PER_TURN = 16000
+MAX_TURNS = 12
+BASH_TIMEOUT_SECONDS = 30
+WEB_SEARCH_MAX_USES = 8
+WEB_FETCH_MAX_USES = 8
+WEB_FETCH_MAX_CONTENT_TOKENS = 15_000
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOL DEFINITIONS
@@ -349,18 +349,10 @@ for the scraper requirement above.
 
 {suggested_sources}
 
-# Reporter's context
-
-The reporter filled out the following during the first agent's interview. \
-Use it to calibrate tone, depth, and focus:
-
-{interview_block}
-
 # Workflow
 
 1. View the Markdown file.
-2. Plan 3–6 research threads based on the beat, the reporter's answers, and \
-   the file's current gaps.
+2. Plan 2–3 research threads based on the beat and the file's current gaps. Be selective — prioritize the most impactful gaps. You have a limited turn budget so move efficiently.
 3. Search + fetch authoritative sources. Prefer primary sources, major \
    newspapers, and government/NGO publications. The `<suggested_sources>` \
    block has vetted starting points when the beat overlaps Chicago, Cook \
@@ -370,34 +362,14 @@ Use it to calibrate tone, depth, and focus:
 5. Edit the file incrementally with the text editor's `str_replace` and \
    `insert` commands. Use `bash` for larger operations (e.g. `cat` to \
    re-read, `wc -w` to track length).
-6. When the file is meaningfully improved, your scraper has run \
-   successfully, and you have no further useful research to add, call \
-   `finalize_beat_book` once and stop.
+6. When the file is meaningfully improved and your scraper has run, call \
+   `finalize_beat_book` immediately — do not keep searching once you have \
+   solid additions.
 
 Keep your running text messages brief — your real work is in the tools. \
 Do not narrate every step; progress updates are enough.\
 """
 
-
-def _format_interview_block(interview_log: List[Dict[str, Any]]) -> str:
-    """Render the captured interview answers into a Markdown-ish block that
-    fits inside the system prompt."""
-    if not interview_log:
-        return "(The reporter did not answer any interview questions.)"
-
-    parts: List[str] = []
-    for round_idx, item in enumerate(interview_log, 1):
-        if item.get("intro"):
-            parts.append(f"**Round {round_idx} intro:** {item['intro']}")
-        answers = item.get("answers") or []
-        for a in answers:
-            q = a.get("question", "").strip()
-            ans = a.get("answer", "")
-            if isinstance(ans, list):
-                ans = ", ".join(str(x) for x in ans) if ans else "(no answer)"
-            ans = str(ans).strip() or "(no answer)"
-            parts.append(f"- Q: {q}\n  A: {ans}")
-    return "\n".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -573,23 +545,26 @@ async def _emit(cb: Optional[Callable], *args) -> None:
 async def run_research_agent(
     sandbox_dir: Path,
     markdown_filename: str,
-    interview_log: List[Dict[str, Any]],
     anthropic_api_key: str,
     on_progress: Optional[ProgressCallback] = None,
     on_tool_status: Optional[ToolStatusCallback] = None,
     on_text: Optional[TextCallback] = None,
+    initial_content: Optional[str] = None,
 ) -> str:
     """Run the research agent and return the final Markdown content.
 
-    The caller is responsible for:
-      - creating `sandbox_dir` and writing `markdown_filename` into it before
-        calling this function.
-      - reading the return value and handing it on to the next pipeline stage.
+    If `initial_content` is provided the file is (re)written with that content
+    before the agent starts — useful when the caller wants to start research
+    before the full draft is ready (concurrent mode).
+
+    The caller is responsible for creating `sandbox_dir` before calling.
     """
     sandbox_dir = Path(sandbox_dir)
     if not sandbox_dir.is_dir():
         raise FileNotFoundError(f"Sandbox directory does not exist: {sandbox_dir}")
     markdown_path = sandbox_dir / markdown_filename
+    if initial_content is not None:
+        markdown_path.write_text(initial_content, encoding="utf-8")
     if not markdown_path.is_file():
         raise FileNotFoundError(f"Markdown file not found in sandbox: {markdown_path}")
 
@@ -597,7 +572,6 @@ async def run_research_agent(
 
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
         markdown_filename=markdown_filename,
-        interview_block=_format_interview_block(interview_log),
         suggested_sources=SUGGESTED_SOURCES,
     )
 
@@ -617,7 +591,7 @@ async def run_research_agent(
     finalized = False
     container_id: Optional[str] = None
 
-    await _emit(on_progress, "starting", f"Opus 4.7 research agent initializing in sandbox {sandbox_dir.name}")
+    await _emit(on_progress, "starting", f"Research agent initializing in sandbox {sandbox_dir.name}")
 
     for turn in range(MAX_TURNS):
         await _emit(on_progress, "thinking", f"Turn {turn + 1}/{MAX_TURNS}")
@@ -634,13 +608,14 @@ async def run_research_agent(
         request_kwargs: Dict[str, Any] = {
             "model": MODEL,
             "max_tokens": MAX_TOKENS_PER_TURN,
-            "system": system_prompt,
+            "system": [{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }],
             "tools": tools,
             "messages": messages,
-            "output_config": {"effort": "medium"},
-            "thinking": (
-                {"type": "adaptive"} if thinking_enabled() else {"type": "disabled"}
-            ),
+            "thinking": thinking_param(),
         }
         if container_id is not None:
             request_kwargs["container"] = container_id

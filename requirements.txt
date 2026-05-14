@@ -5,7 +5,14 @@ httpx
 pydantic
 openai
 anthropic
-markitdown[all]
+pymupdf
+python-docx
+python-pptx
+openpyxl
+xlrd
+beautifulsoup4
+striprtf
+ebooklib
 numpy
 umap-learn
 hdbscan

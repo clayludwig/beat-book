@@ -18,8 +18,9 @@ import json
 import os
 import queue
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
@@ -53,20 +54,35 @@ app = FastAPI(title="Beat Book Builder")
 # Files-in-flight per /ingest request. Serial so a multi-file upload
 # doesn't multiply concurrent Claude calls against Anthropic's per-tier
 # concurrent-request limit (ingest.py itself runs chunks serially too).
-_INGEST_CONCURRENCY = 1
+_INGEST_CONCURRENCY = 4
 
 # In-memory session store: session_id → PipelineResult
 sessions: Dict[str, PipelineResult] = {}
 
 
+@dataclass
+class IngestJob:
+    job_id: str
+    queue: queue.Queue = field(default_factory=queue.Queue)
+    done: bool = False
+    result: Optional[dict] = None
+    error: str = ""
+
+
+ingest_jobs: Dict[str, IngestJob] = {}
+
+
 class StoryIn(BaseModel):
-    """Story payload accepted by /process. The pipeline only requires
+    """Content entry payload accepted by /process. The pipeline only requires
     title + content; the rest are passed through if non-empty."""
     title: str
     content: str
     date: str = ""
     author: str = ""
+    organization: str = ""
     link: str = ""
+    content_type: str = "article"
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ProcessRequest(BaseModel):
@@ -86,14 +102,104 @@ async def root():
     return FileResponse("static/index.html")
 
 
-@app.post("/ingest")
-async def ingest(
+async def _run_ingest_job(
+    job: IngestJob,
+    buffered_files: List[tuple[str, bytes]],
+    url_list: List[str],
+    *,
+    anthropic_key: str,
+) -> None:
+    loop = asyncio.get_event_loop()
+    semaphore = asyncio.Semaphore(_INGEST_CONCURRENCY)
+    total_sources = len(buffered_files) + len(url_list)
+
+    job.queue.put({"type": "job_started", "total_sources": total_sources})
+
+    async def run_file(name: str, raw: bytes):
+        async with semaphore:
+            job.queue.put({"type": "source_started", "source_label": name})
+
+            def on_progress(payload: dict):
+                job.queue.put({
+                    "type": "source_progress",
+                    "source_label": name,
+                    **payload,
+                })
+
+            result = await loop.run_in_executor(
+                None,
+                lambda: ingest_file(
+                    name,
+                    raw,
+                    anthropic_key,
+                    on_progress=on_progress,
+                ),
+            )
+            job.queue.put({
+                "type": "source_done",
+                "source_label": name,
+                "num_entries": len(result.stories),
+                "excluded": result.excluded,
+            })
+            return result
+
+    async def run_url(url: str):
+        async with semaphore:
+            job.queue.put({"type": "source_started", "source_label": url})
+
+            def on_progress(payload: dict):
+                job.queue.put({
+                    "type": "source_progress",
+                    "source_label": url,
+                    **payload,
+                })
+
+            result = await loop.run_in_executor(
+                None,
+                lambda: ingest_url(
+                    url,
+                    anthropic_key,
+                    on_progress=on_progress,
+                ),
+            )
+            job.queue.put({
+                "type": "source_done",
+                "source_label": url,
+                "num_entries": len(result.stories),
+                "excluded": result.excluded,
+            })
+            return result
+
+    tasks = [run_file(name, raw) for name, raw in buffered_files]
+    tasks += [run_url(u) for u in url_list]
+
+    try:
+        results = await asyncio.gather(*tasks)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        job.error = f"Ingestion failed: {type(e).__name__}: {e}"
+        job.queue.put({"type": "error", "error": job.error})
+        job.done = True
+        return
+
+    sources = [r.to_preview_dict() for r in results]
+    total_stories = sum(len(r.stories) for r in results)
+    job.result = {
+        "sources": sources,
+        "total_stories": total_stories,
+        "total_sources": len(results),
+    }
+    job.queue.put({"type": "done", **job.result})
+    job.done = True
+
+
+@app.post("/ingest/start")
+async def ingest_start(
     files: List[UploadFile] = File(default_factory=list),
     urls: str = Form(""),
 ):
-    """Run multi-format extraction + LLM normalization on uploaded files
-    and/or URLs. Returns a preview of detected stories per source — the
-    frontend reviews/edits, then POSTs the confirmed list to /process."""
+    """Start ingest in the background and return a job id."""
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not anthropic_key:
         return JSONResponse(
@@ -107,49 +213,44 @@ async def ingest(
             {"error": "No files or URLs provided."}, status_code=400
         )
 
-    # Buffer every file fully into memory before spawning workers — the
-    # UploadFile stream is read-once and closes after the request scope
-    # ends, but our executor jobs run in parallel.
     buffered_files: List[tuple[str, bytes]] = []
     for f in files:
         raw = await f.read()
         buffered_files.append((f.filename or "upload.bin", raw))
 
-    loop = asyncio.get_event_loop()
-    semaphore = asyncio.Semaphore(_INGEST_CONCURRENCY)
+    job_id = str(uuid.uuid4())[:10]
+    job = IngestJob(job_id=job_id)
+    ingest_jobs[job_id] = job
 
-    async def run_file(name: str, raw: bytes):
-        async with semaphore:
-            return await loop.run_in_executor(
-                None, ingest_file, name, raw, anthropic_key
-            )
-
-    async def run_url(url: str):
-        async with semaphore:
-            return await loop.run_in_executor(
-                None, ingest_url, url, anthropic_key
-            )
-
-    tasks = [run_file(name, raw) for name, raw in buffered_files]
-    tasks += [run_url(u) for u in url_list]
-
-    try:
-        results = await asyncio.gather(*tasks)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return JSONResponse(
-            {"error": f"Ingestion failed: {type(e).__name__}: {e}"},
-            status_code=500,
+    asyncio.create_task(
+        _run_ingest_job(
+            job,
+            buffered_files,
+            url_list,
+            anthropic_key=anthropic_key,
         )
+    )
 
-    sources = [r.to_preview_dict() for r in results]
-    total_stories = sum(len(r.stories) for r in results)
-    return JSONResponse({
-        "sources": sources,
-        "total_stories": total_stories,
-        "total_sources": len(results),
-    })
+    return JSONResponse({"job_id": job_id})
+
+
+@app.get("/ingest/stream/{job_id}")
+async def ingest_stream(job_id: str):
+    job = ingest_jobs.get(job_id)
+    if not job:
+        return JSONResponse({"error": "Invalid ingest job."}, status_code=404)
+
+    async def event_stream():
+        while not job.done or not job.queue.empty():
+            try:
+                msg = job.queue.get_nowait()
+                yield f"data: {json.dumps(msg)}\n\n"
+            except queue.Empty:
+                await asyncio.sleep(0.1)
+        if job.error and job.result is None:
+            yield f"data: {json.dumps({'type': 'error', 'error': job.error})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/process")
@@ -239,10 +340,18 @@ async def agent_ws(ws: WebSocket, session_id: str):
         await ws.close()
         return
 
-    # Session-scoped record of every interview round the first agent runs.
-    # The research agent reads this so it can tailor its research to the
-    # reporter's stated beat, audience, and experience level.
-    interview_log: List[Dict] = []
+    # ── Wait for topic selection from the client ───────────────────────────
+    selected_topics: list[str] = []
+    try:
+        raw = await asyncio.wait_for(ws.receive_text(), timeout=120)
+        msg = json.loads(raw)
+        if msg.get("type") == "select_topics":
+            valid = set(pipeline_result.topics.keys())
+            selected_topics = [t for t in msg.get("topics", []) if t in valid]
+    except (asyncio.TimeoutError, Exception):
+        pass
+    if not selected_topics:
+        selected_topics = list(pipeline_result.topics.keys())
 
     # ── Callbacks ─────────────────────────────────────────────────────────
 
@@ -250,99 +359,112 @@ async def agent_ws(ws: WebSocket, session_id: str):
         """Send agent text to the frontend."""
         await ws.send_json({"type": "message", "text": text})
 
-    async def on_interview(interview_data: dict) -> str:
-        """Send a batch of questions to the frontend, wait for all answers,
-        return a single formatted string for the agent to read."""
-        questions = interview_data.get("questions", [])
-        await ws.send_json({
-            "type": "questions",
-            "intro": interview_data.get("intro", ""),
-            "questions": questions,
-        })
+    async def on_heartbeat():
+        """Keep the WebSocket alive during long Anthropic API calls."""
+        await ws.send_json({"type": "heartbeat"})
 
-        response = await ws.receive_json()
-        answers = response.get("answers", [])
+    # research_task is set by on_exploration_done and awaited in on_beat_book.
+    _research_task: asyncio.Task | None = None
+    _research_filename: str = "beat_book.md"
 
-        interview_log.append({
-            "intro": interview_data.get("intro", ""),
-            "questions": questions,
-            "answers": answers,
-        })
+    async def on_exploration_done(context_doc: str):
+        """Start the Opus research agent as soon as exploration is done,
+        in parallel with Haiku's beat-book write."""
+        nonlocal _research_task, _research_filename
+        filename = _research_filename
+        sandbox_dir = SANDBOX_ROOT / session_id
+        sandbox_dir.mkdir(parents=True, exist_ok=True)
 
-        lines = ["Reporter's answers:", ""]
-        for i, item in enumerate(answers, 1):
-            q = item.get("question", "")
-            a = item.get("answer", "")
-            if isinstance(a, list):
-                a = ", ".join(str(x) for x in a) if a else "(no answer)"
-            lines.append(f"{i}. {q}")
-            lines.append(f"   → {a}")
-            lines.append("")
-        return "\n".join(lines)
+        await ws.send_json({"type": "research_started", "filename": filename})
+
+        async def on_research_progress(stage: str, detail: str):
+            await ws.send_json({"type": "research_progress", "stage": stage, "detail": detail})
+
+        async def on_research_tool_status(tool_name: str, desc: str, detail: str):
+            await ws.send_json({"type": "research_tool_status",
+                                "tool_name": tool_name, "tool": desc, "detail": detail})
+
+        async def on_research_text(text: str):
+            await ws.send_json({"type": "research_message", "text": text})
+
+        async def _run():
+            try:
+                return await run_research_agent(
+                    sandbox_dir=sandbox_dir,
+                    markdown_filename=filename,
+                    anthropic_api_key=anthropic_key,
+                    on_progress=on_research_progress,
+                    on_tool_status=on_research_tool_status,
+                    on_text=on_research_text,
+                    initial_content=context_doc,
+                )
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                return None  # fallback: use draft from on_beat_book
+
+        _research_task = asyncio.create_task(_run())
 
     async def on_beat_book(filename: str, markdown: str):
-        """Run the research agent on the first agent's draft, then hand the
-        revised markdown to the citation matcher.
+        """Merge the Haiku draft with the parallel Opus research, then hand
+        the combined Markdown to the citation matcher.
 
-        Pipeline: draft md → research agent (sandboxed) → revised md → citations.
+        Pipeline: [Haiku write ∥ Opus research] → merge → citations.
         """
-        # ── 1. Persist the raw draft so the user can fall back to it ─────
+        nonlocal _research_filename
+        _research_filename = filename
+
+        # ── 1. Persist the raw draft ──────────────────────────────────────
         stem = Path(filename).stem
         draft_path = OUTPUT_DIR / f"{stem}.draft.md"
         draft_path.write_text(markdown, encoding="utf-8")
 
-        # ── 2. Prepare a per-session sandbox for the research agent ──────
+        # ── 2. Await research (may already be done if write was slow) ─────
         sandbox_dir = SANDBOX_ROOT / session_id
         sandbox_dir.mkdir(parents=True, exist_ok=True)
-        (sandbox_dir / filename).write_text(markdown, encoding="utf-8")
 
-        await ws.send_json({
-            "type": "research_started",
-            "filename": filename,
-        })
+        research_result: str | None = None
+        if _research_task is not None:
+            # Update the sandbox file with the real draft so Opus can
+            # reference it if it hasn't already finished.
+            (sandbox_dir / filename).write_text(markdown, encoding="utf-8")
+            research_result = await _research_task
+        else:
+            # on_exploration_done never fired (very small corpus) — fall back
+            # to sequential research.
+            await ws.send_json({"type": "research_started", "filename": filename})
+            (sandbox_dir / filename).write_text(markdown, encoding="utf-8")
 
-        async def on_research_progress(stage: str, detail: str):
-            await ws.send_json({
-                "type": "research_progress",
-                "stage": stage,
-                "detail": detail,
-            })
+            async def on_research_progress(stage: str, detail: str):
+                await ws.send_json({"type": "research_progress",
+                                    "stage": stage, "detail": detail})
 
-        async def on_research_tool_status(tool_name: str, desc: str, detail: str):
-            await ws.send_json({
-                "type": "research_tool_status",
-                "tool_name": tool_name,
-                "tool": desc,
-                "detail": detail,
-            })
+            async def on_research_tool_status(tool_name: str, desc: str, detail: str):
+                await ws.send_json({"type": "research_tool_status",
+                                    "tool_name": tool_name, "tool": desc, "detail": detail})
 
-        async def on_research_text(text: str):
-            await ws.send_json({
-                "type": "research_message",
-                "text": text,
-            })
+            async def on_research_text(text: str):
+                await ws.send_json({"type": "research_message", "text": text})
 
-        try:
-            revised_markdown = await run_research_agent(
-                sandbox_dir=sandbox_dir,
-                markdown_filename=filename,
-                interview_log=interview_log,
-                anthropic_api_key=anthropic_key,
-                on_progress=on_research_progress,
-                on_tool_status=on_research_tool_status,
-                on_text=on_research_text,
-            )
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            await ws.send_json({
-                "type": "error",
-                "text": (
-                    f"Research agent failed ({type(e).__name__}: {e}). "
-                    "Falling back to the first agent's draft."
-                ),
-            })
-            revised_markdown = markdown
+            try:
+                research_result = await run_research_agent(
+                    sandbox_dir=sandbox_dir,
+                    markdown_filename=filename,
+                    anthropic_api_key=anthropic_key,
+                    on_progress=on_research_progress,
+                    on_tool_status=on_research_tool_status,
+                    on_text=on_research_text,
+                )
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                await ws.send_json({
+                    "type": "error",
+                    "text": f"Research agent failed ({type(e).__name__}: {e}). Using draft.",
+                })
+
+        # research_result is the Opus-revised content; fall back to draft
+        revised_markdown = research_result if research_result else markdown
 
         await ws.send_json({"type": "research_complete"})
 
@@ -428,22 +550,38 @@ async def agent_ws(ws: WebSocket, session_id: str):
             "detail": detail,
         })
 
+    async def on_agent_progress(pct: float, label: str):
+        """Send agent coverage-review progress to frontend (0–100)."""
+        await ws.send_json({
+            "type": "agent_progress",
+            "pct": pct,
+            "label": label,
+        })
+
     # ── Run agent ─────────────────────────────────────────────────────────
 
     try:
         await run_agent(
             pipeline_result=pipeline_result,
             anthropic_key=anthropic_key,
-            on_interview=on_interview,
             on_message=on_message,
             on_beat_book=on_beat_book,
             on_tool_status=on_tool_status,
+            on_heartbeat=on_heartbeat,
+            on_agent_progress=on_agent_progress,
+            on_exploration_done=on_exploration_done,
+            selected_topics=selected_topics,
         )
     except WebSocketDisconnect:
         print(f"Session {session_id}: client disconnected.")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         try:
-            await ws.send_json({"type": "error", "text": f"Agent error: {str(e)}"})
+            await ws.send_json({
+                "type": "error",
+                "text": f"Agent error ({type(e).__name__}): {e}",
+            })
         except Exception:
             pass
         raise

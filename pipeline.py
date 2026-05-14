@@ -8,7 +8,10 @@ Returns a PipelineResult with stories, topics, and helper lookups.
 """
 
 import hashlib
+import logging
 import pickle
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple, Callable
@@ -22,7 +25,17 @@ from openai import OpenAI
 import umap
 import hdbscan
 
-from claude_client import CHAT_MODEL, chat_client, thinking_param
+import anthropic as anthropic_sdk
+
+from claude_client import (
+    ANTHROPIC_SEMAPHORE,
+    CHAT_MODEL,
+    MAX_ANTHROPIC_CONCURRENT,
+    RATE_LIMIT_MAX_RETRIES,
+    chat_client,
+    rate_limit_pause,
+    thinking_param,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -31,7 +44,8 @@ from claude_client import CHAT_MODEL, chat_client, thinking_param
 # Embeddings stay on OpenAI: Anthropic doesn't host an embedding API, and we
 # want this to run anywhere without requiring a local model.
 EMBED_MODEL = "text-embedding-3-small"
-LABEL_MODEL = CHAT_MODEL
+# Cluster labels are 2-5 words — Haiku is sufficient and ~10x faster than Sonnet.
+LABEL_MODEL = "claude-haiku-4-5-20251001"
 CACHE_DIR   = Path(".cache")
 SAMPLE_SIZE_FOR_LABEL = 8
 EMBED_BATCH_SIZE = 100
@@ -52,12 +66,9 @@ class PipelineResult:
     specific_topics: Dict[str, List[int]]        # specific topic → [story indices]
 
     def topic_summary(self) -> str:
-        """Human-readable summary of discovered topics."""
-        lines = ["## Broad Topics"]
+        """Human-readable summary of the broad topics the agent should explore."""
+        lines = ["## Topics"]
         for label, indices in sorted(self.broad_topics.items(), key=lambda x: -len(x[1])):
-            lines.append(f"  - **{label}** ({len(indices)} stories)")
-        lines.append("\n## Specific Topics")
-        for label, indices in sorted(self.specific_topics.items(), key=lambda x: -len(x[1])):
             lines.append(f"  - **{label}** ({len(indices)} stories)")
         return "\n".join(lines)
 
@@ -233,12 +244,24 @@ def _label_cluster(client, stories: List[dict], indices: List[int], reduced: np.
         "'Immigration Policy', 'Crime and Sentencing', 'City Council', 'Transit'."
     )
 
-    resp = client.messages.create(
-        model=LABEL_MODEL,
-        max_tokens=LABEL_MAX_TOKENS,
-        messages=[{"role": "user", "content": prompt}],
-        thinking=thinking_param(),
-    )
+    for rl_attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            with ANTHROPIC_SEMAPHORE:
+                resp = client.messages.create(
+                    model=LABEL_MODEL,
+                    max_tokens=LABEL_MAX_TOKENS,
+                    messages=[{"role": "user", "content": prompt}],
+                    thinking=thinking_param(),
+                )
+            break
+        except anthropic_sdk.RateLimitError as e:
+            if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
+                raise
+            pause = rate_limit_pause(rl_attempt, e)
+            logging.warning("Pipeline label rate limited; waiting %.0fs (attempt %d/%d).",
+                            pause, rl_attempt + 1, RATE_LIMIT_MAX_RETRIES)
+            time.sleep(pause)
+
     text = "".join(
         b.text for b in resp.content
         if getattr(b, "type", None) == "text"
@@ -246,16 +269,101 @@ def _label_cluster(client, stories: List[dict], indices: List[int], reduced: np.
     return text.strip().strip('"').strip("'")
 
 
+def _cluster_snippets(stories, indices, reduced):
+    cluster_vecs = reduced[indices]
+    centroid     = cluster_vecs.mean(axis=0)
+    dists        = np.linalg.norm(cluster_vecs - centroid, axis=1)
+    order        = np.argsort(dists)
+    sampled      = [indices[i] for i in order[:SAMPLE_SIZE_FOR_LABEL]]
+    out = []
+    for i in sampled:
+        s = stories[i]
+        words   = s.get("content", "").split()
+        excerpt = " ".join(words[10:40])
+        out.append(f"  \u2022 {s['title']} \u2014 {excerpt}")
+    return "\n".join(out)
+
+
 def _label_all(client, stories, labels, reduced, level_name, on_progress=None):
+    """Label all clusters at this level in a single Haiku call.
+
+    Falls back to per-cluster labeling if the batched call's JSON parse fails.
+    """
+    import json
+    import re
+
     unique = sorted(c for c in np.unique(labels) if c != -1)
     print(f"Labeling {len(unique)} {level_name} clusters\u2026")
-    result = {}
-    for i, cid in enumerate(tqdm(unique, desc=f"Labeling ({level_name})")):
+    if not unique:
+        return {}
+
+    blocks = []
+    for cid in unique:
         indices = list(np.where(labels == cid)[0])
-        result[cid] = _label_cluster(client, stories, indices, reduced)
-        if on_progress:
-            on_progress(f"labeling_{level_name}", (i + 1) / len(unique),
-                        f"Labeled {i+1}/{len(unique)} {level_name} topics")
+        blocks.append(f"Cluster {cid}:\n{_cluster_snippets(stories, indices, reduced)}")
+    prompt = (
+        "You are labeling clusters of news articles from a local newspaper.\n"
+        f"There are {len(unique)} clusters below. Each cluster shows its most "
+        "representative headlines and excerpts.\n\n"
+        + "\n\n".join(blocks)
+        + "\n\nReturn ONLY a JSON object mapping each cluster id (as a string) "
+        "to a concise topic label (2\u20135 words) describing the SUBJECT MATTER. "
+        "Focus on WHAT happens, not WHERE \u2014 avoid labels like 'Chicago news', "
+        "'local community news', or 'Illinois news' unless the geography itself "
+        "is the distinguishing feature. Good labels: 'High School Basketball', "
+        "'City Budget Disputes', 'Immigration Policy'. "
+        'Example output: {"0": "City Council", "1": "Transit", ...}'
+    )
+
+    if on_progress:
+        on_progress(f"labeling_{level_name}", 0.0,
+                    f"Labeling {len(unique)} {level_name} topics in one batch\u2026")
+
+    for rl_attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            with ANTHROPIC_SEMAPHORE:
+                resp = client.messages.create(
+                    model=LABEL_MODEL,
+                    max_tokens=min(2048, 128 + 32 * len(unique)),
+                    messages=[{"role": "user", "content": prompt}],
+                    thinking=thinking_param(),
+                )
+            break
+        except anthropic_sdk.RateLimitError as e:
+            if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
+                raise
+            pause = rate_limit_pause(rl_attempt, e)
+            logging.warning("Batch label rate limited; waiting %.0fs (attempt %d/%d).",
+                            pause, rl_attempt + 1, RATE_LIMIT_MAX_RETRIES)
+            time.sleep(pause)
+
+    text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    parsed = None
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            parsed = None
+
+    result = {}
+    if isinstance(parsed, dict):
+        for cid in unique:
+            label = parsed.get(str(cid)) or parsed.get(int(cid)) if isinstance(parsed, dict) else None
+            if isinstance(label, str) and label.strip():
+                result[cid] = label.strip().strip('"').strip("'")
+
+    missing = [cid for cid in unique if cid not in result]
+    if missing:
+        logging.warning("Batch label missed %d/%d clusters; filling individually.",
+                        len(missing), len(unique))
+        for cid in missing:
+            indices = list(np.where(labels == cid)[0])
+            result[cid] = _label_cluster(client, stories, indices, reduced)
+
+    if on_progress:
+        on_progress(f"labeling_{level_name}", 1.0,
+                    f"Labeled {len(unique)}/{len(unique)} {level_name} topics")
     return result
 
 
@@ -342,14 +450,11 @@ def run_pipeline(stories: List[dict], openai_key: str, anthropic_key: str,
         if i not in all_topics[st]:
             all_topics[st].append(i)
 
-        if st.lower() == bt.lower():
-            story_topics.append([bt])
-        else:
-            story_topics.append([bt, st])
+        story_topics.append([bt])
 
     return PipelineResult(
         stories=stories,
-        topics=all_topics,
+        topics=broad_topics,
         story_topics=story_topics,
         broad_topics=broad_topics,
         specific_topics=specific_topics,
