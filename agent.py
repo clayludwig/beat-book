@@ -238,6 +238,25 @@ def _target_for_topic(topic_size: int) -> int:
     return (topic_size + 1) // 2
 
 
+def _derive_filename(pipeline_result: PipelineResult) -> str:
+    """Build a descriptive snake_case filename from the top broad topics."""
+    import re
+    topics = sorted(
+        pipeline_result.broad_topics.items(),
+        key=lambda x: -len(x[1]),
+    )
+    labels = [label for label, _ in topics[:3]]
+    if not labels:
+        return "beat_book.md"
+    slug = "_".join(labels)
+    slug = slug.lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", slug)
+    slug = slug.strip("_")
+    if len(slug) > 80:
+        slug = slug[:80].rstrip("_")
+    return f"{slug}_beat_book.md"
+
+
 def _progress_report(
     pipeline_result: PipelineResult,
     listed_topics: set,
@@ -663,7 +682,7 @@ async def run_agent(
         if force_generate:
             # Final-write turn: the text body IS the beat book.
             if text_combined:
-                await on_beat_book("beat_book.md", text_combined)
+                await on_beat_book(_derive_filename(pipeline_result), text_combined)
                 beat_book_done = True
                 break
             else:
